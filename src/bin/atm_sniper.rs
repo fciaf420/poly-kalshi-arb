@@ -81,6 +81,15 @@ struct Args {
     /// Completion only mode - disable edge/penny/cheap buying, only complete existing positions
     #[arg(long, default_value_t = false)]
     completion_only: bool,
+
+    /// Delta-50 mode - simple strategy: bid at max_bid when market price is ~50¢ (50/50 odds)
+    /// Ignores fair value calculations, just watches market prices
+    #[arg(long, default_value_t = false)]
+    delta_50: bool,
+
+    /// Delta-50 threshold: market price must be within this range of 50¢ (default: 5 = 45-55¢)
+    #[arg(long, default_value_t = 5)]
+    delta_50_range: i64,
 }
 
 use arb_bot::kalshi::{KalshiApiClient, KalshiConfig};
@@ -326,9 +335,17 @@ async fn main() -> Result<()> {
     let vol = args.vol / 100.0; // Convert % to decimal
     let dry_run = !args.live;
     let completion_only = args.completion_only;
+    let delta_50 = args.delta_50;
+    let delta_50_range = args.delta_50_range;
 
     info!("════════════════════════════════════════════════════════════════════════");
-    if completion_only {
+    if delta_50 {
+        info!("STRATEGY: DELTA-50 MODE (Simple)");
+        info!("   - Watch market price (not fair value)");
+        info!("   - When YES or NO price is {}¢-{}¢ (50/50 odds)", 50 - delta_50_range, 50 + delta_50_range);
+        info!("   - Bid {}¢ on that side", max_bid);
+        info!("   - No edge calc, no penny bids, no cheap buys");
+    } else if completion_only {
         info!("STRATEGY: COMPLETION ONLY MODE");
         info!("   - Edge buying: DISABLED");
         info!("   - Penny bidding: DISABLED");
@@ -348,8 +365,12 @@ async fn main() -> Result<()> {
     info!("════════════════════════════════════════════════════════════════════════");
 
     info!("CONFIG:");
-    info!("   Mode: {}{}", if dry_run { "🔍 DRY RUN" } else { "🚀 LIVE" }, if completion_only { " (COMPLETION ONLY)" } else { "" });
-    if !completion_only {
+    let mode_str = if delta_50 { " (DELTA-50)" } else if completion_only { " (COMPLETION ONLY)" } else { "" };
+    info!("   Mode: {}{}", if dry_run { "🔍 DRY RUN" } else { "🚀 LIVE" }, mode_str);
+    if delta_50 {
+        info!("   Delta-50 range: {}¢-{}¢", 50 - delta_50_range, 50 + delta_50_range);
+        info!("   Bid price: {}¢", max_bid);
+    } else if !completion_only {
         info!("   YES edge: {}¢ | NO edge: {}¢ | Aggro: {}¢", req_yes_edge, req_no_edge, aggro_edge);
         info!("   Cheap buys: YES≤{}¢ NO≥{}¢ ({}+min)", cheap_yes, cheap_no, cheap_minutes);
         info!("   Max bid (at ATM): {}¢", max_bid);
@@ -853,8 +874,36 @@ async fn main() -> Result<()> {
                                             // Only trade YES/NO if edge exists, no existing order, not on cancel cooldown,
                                             // AND we don't have unhedged positions on that side already
                                             // In completion_only mode, skip all edge-based buying
-                                            let mut need_yes = !completion_only && yes_has_edge && orders.yes_order_id.is_none() && yes_cancel_ok && unmatched_yes <= 0;
-                                            let mut need_no = !completion_only && no_has_edge && orders.no_order_id.is_none() && no_cancel_ok && unmatched_no <= 0;
+                                            let mut need_yes = !completion_only && !delta_50 && yes_has_edge && orders.yes_order_id.is_none() && yes_cancel_ok && unmatched_yes <= 0;
+                                            let mut need_no = !completion_only && !delta_50 && no_has_edge && orders.no_order_id.is_none() && no_cancel_ok && unmatched_no <= 0;
+
+                                            // DELTA-50 MODE: Simple strategy - just bid when market price is ~50¢
+                                            let mut delta_50_yes = false;
+                                            let mut delta_50_no = false;
+                                            if delta_50 {
+                                                let yes_market = yes_ask.unwrap_or(100);
+                                                let no_market = no_ask.unwrap_or(100);
+
+                                                // Check if YES is in the 50/50 range and we can bid below it
+                                                if yes_market >= (50 - delta_50_range) && yes_market <= (50 + delta_50_range)
+                                                   && yes_market > max_bid  // Only if we have edge
+                                                   && orders.yes_order_id.is_none() && yes_cancel_ok {
+                                                    need_yes = true;
+                                                    delta_50_yes = true;
+                                                    info!("[DELTA-50] YES: market={}¢ in range {}¢-{}¢, bidding {}¢ on {}",
+                                                          yes_market, 50 - delta_50_range, 50 + delta_50_range, max_bid, ticker);
+                                                }
+
+                                                // Check if NO is in the 50/50 range and we can bid below it
+                                                if no_market >= (50 - delta_50_range) && no_market <= (50 + delta_50_range)
+                                                   && no_market > max_bid  // Only if we have edge
+                                                   && orders.no_order_id.is_none() && no_cancel_ok {
+                                                    need_no = true;
+                                                    delta_50_no = true;
+                                                    info!("[DELTA-50] NO: market={}¢ in range {}¢-{}¢, bidding {}¢ on {}",
+                                                          no_market, 50 - delta_50_range, 50 + delta_50_range, max_bid, ticker);
+                                                }
+                                            }
 
                                             // Log when we skip due to unhedged position
                                             if yes_has_edge && unmatched_yes > 0 {
@@ -885,12 +934,12 @@ async fn main() -> Result<()> {
                                             }
 
                                             // CHEAP OPTION STRATEGY: buy cheap options with enough time left
-                                            // Disabled in completion_only mode
+                                            // Disabled in completion_only mode and delta_50 mode
                                             let minutes_left = secs / 60;
                                             let mut cheap_yes_trigger = false;
                                             let mut cheap_no_trigger = false;
 
-                                            if !completion_only && minutes_left >= cheap_minutes && orders.yes_order_id.is_none() && yes_cancel_ok {
+                                            if !completion_only && !delta_50 && minutes_left >= cheap_minutes && orders.yes_order_id.is_none() && yes_cancel_ok {
                                                 // YES is cheap if ask <= cheap_yes threshold
                                                 if let Some(ask) = yes_ask {
                                                     if ask <= cheap_yes as i64 {
@@ -901,7 +950,7 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            if !completion_only && minutes_left >= cheap_minutes && orders.no_order_id.is_none() && no_cancel_ok {
+                                            if !completion_only && !delta_50 && minutes_left >= cheap_minutes && orders.no_order_id.is_none() && no_cancel_ok {
                                                 // NO is cheap if NO ask <= (100 - cheap_no) threshold
                                                 // e.g., if cheap_no=80, buy NO when NO ask <= 20
                                                 if let Some(no_price) = no_ask {
@@ -916,18 +965,18 @@ async fn main() -> Result<()> {
 
                                             // NO LIQUIDITY STRATEGY: if no bids exist (ask=100) and fair is reasonable, bid 1¢
                                             // This gets us first in line when markets are empty
-                                            // Disabled in completion_only mode
+                                            // Disabled in completion_only mode and delta_50 mode
                                             let no_yes_liquidity = yes_ask.map(|a| a >= 100).unwrap_or(true);
                                             let no_no_liquidity = no_ask.map(|a| a >= 100).unwrap_or(true);
                                             let mut penny_yes = false;
                                             let mut penny_no = false;
 
-                                            if !completion_only && no_yes_liquidity && fair_yes >= 20 && fair_yes <= 80 && orders.yes_order_id.is_none() && yes_cancel_ok {
+                                            if !completion_only && !delta_50 && no_yes_liquidity && fair_yes >= 20 && fair_yes <= 80 && orders.yes_order_id.is_none() && yes_cancel_ok {
                                                 need_yes = true;
                                                 penny_yes = true;
                                                 info!("[PENNY] YES: no liquidity, fair={}¢, bidding 1¢ on {}", fair_yes, ticker);
                                             }
-                                            if !completion_only && no_no_liquidity && fair_no >= 20 && fair_no <= 80 && orders.no_order_id.is_none() && no_cancel_ok {
+                                            if !completion_only && !delta_50 && no_no_liquidity && fair_no >= 20 && fair_no <= 80 && orders.no_order_id.is_none() && no_cancel_ok {
                                                 need_no = true;
                                                 penny_no = true;
                                                 info!("[PENNY] NO: no liquidity, fair={}¢, bidding 1¢ on {}", fair_no, ticker);
@@ -946,8 +995,9 @@ async fn main() -> Result<()> {
 
                                             // Aggro = edge high enough AND cooldown passed AND not penny bid (no ask to hit)
                                             // If edge is high but cooldown active, we'll fall through to passive bid
-                                            let yes_aggro = yes_actual >= aggro_edge && yes_ioc_ok && !penny_yes;
-                                            let no_aggro = no_actual >= aggro_edge && no_ioc_ok && !penny_no;
+                                            // Disabled in delta_50 mode (always passive bids)
+                                            let yes_aggro = !delta_50 && yes_actual >= aggro_edge && yes_ioc_ok && !penny_yes;
+                                            let no_aggro = !delta_50 && no_actual >= aggro_edge && no_ioc_ok && !penny_no;
 
                                             if !need_yes && !need_no {
                                                 continue;
@@ -955,8 +1005,9 @@ async fn main() -> Result<()> {
 
                                             // Bid price = fair - required_edge (capped at max_bid only near ATM)
                                             // For penny bids (no liquidity), always bid 1¢
-                                            let yes_our_bid = if penny_yes { 1 } else { calc_bid_price(fair_yes, req_yes_edge, max_bid) };
-                                            let no_our_bid = if penny_no { 1 } else { calc_bid_price(fair_no, req_no_edge, max_bid) };
+                                            // In delta_50 mode, always use max_bid
+                                            let yes_our_bid = if delta_50_yes { max_bid } else if penny_yes { 1 } else { calc_bid_price(fair_yes, req_yes_edge, max_bid) };
+                                            let no_our_bid = if delta_50_no { max_bid } else if penny_no { 1 } else { calc_bid_price(fair_no, req_no_edge, max_bid) };
 
                                             drop(s);
 
