@@ -98,6 +98,7 @@ struct Market {
     yes_token: String,
     no_token: String,
     strike: Option<f64>,
+    start_ts: Option<i64>,  // Unix timestamp when 15m window started
     asset: String, // "BTC" or "ETH"
     expiry_minutes: Option<f64>,
     // Orderbook
@@ -130,10 +131,12 @@ impl Position {
 }
 
 /// Price feed state
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PriceState {
     btc_price: Option<f64>,
     eth_price: Option<f64>,
+    sol_price: Option<f64>,
+    xrp_price: Option<f64>,
     last_update: Option<std::time::Instant>,
 }
 
@@ -255,7 +258,7 @@ const POLY_SERIES_SLUGS: &[(&str, &str)] = &[
 ];
 
 /// Discover crypto markets on Polymarket via series API
-async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
+async fn discover_markets(market_filter: Option<&str>, polygon_api_key: &str) -> Result<Vec<Market>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -352,19 +355,40 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
                     continue;
                 }
 
-                // Try to parse strike from question
-                let strike = parse_strike_from_question(&question);
+                // Parse start timestamp from event slug and fetch opening price
+                // Only fetch if the market has already started (timestamp is in the past)
+                let now_ts = Utc::now().timestamp();
+                let strike = if let Some(start_ts) = parse_start_timestamp(&event_slug) {
+                    if start_ts <= now_ts {
+                        // Market already started, fetch historical price
+                        match fetch_historical_price(&client, asset, start_ts, polygon_api_key).await {
+                            Some(price) => {
+                                info!("[DISCOVER] {} opening price @{}: ${:.2}", asset, start_ts, price);
+                                Some(price)
+                            }
+                            None => {
+                                warn!("[DISCOVER] Failed to fetch opening price for {} @{}", asset, start_ts);
+                                None
+                            }
+                        }
+                    } else {
+                        // Market hasn't started yet - we'll need to capture opening price when it starts
+                        info!("[DISCOVER] {} market starts in {}s, will capture opening price live",
+                              asset, start_ts - now_ts);
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                info!("[DISCOVER] Found: {} | strike={:?} | expiry={:.1?}min | cid={}",
-                      &question[..question.len().min(60)], strike, expiry_minutes,
-                      &cid[..cid.len().min(20)]);
-
+                let start_ts = parse_start_timestamp(&event_slug);
                 markets.push(Market {
                     condition_id: cid,
                     question,
                     yes_token: token_ids[0].clone(),
                     no_token: token_ids[1].clone(),
                     strike,
+                    start_ts,
                     asset: asset.to_string(),
                     expiry_minutes,
                     yes_ask: None,
@@ -416,6 +440,67 @@ fn parse_strike_from_question(question: &str) -> Option<f64> {
         }
     }
     None
+}
+
+/// Parse start timestamp from event slug (e.g., "btc-updown-15m-1761194700" -> 1761194700)
+fn parse_start_timestamp(slug: &str) -> Option<i64> {
+    // The slug ends with a Unix timestamp
+    slug.rsplit('-').next()?.parse::<i64>().ok()
+}
+
+/// Fetch historical price from Polygon.io at a specific timestamp
+async fn fetch_historical_price(
+    client: &reqwest::Client,
+    asset: &str,
+    timestamp_secs: i64,
+    api_key: &str,
+) -> Option<f64> {
+    // Map asset to Polygon ticker
+    let ticker = match asset {
+        "BTC" => "X:BTCUSD",
+        "ETH" => "X:ETHUSD",
+        "SOL" => "X:SOLUSD",
+        "XRP" => "X:XRPUSD",
+        _ => return None,
+    };
+
+    // Convert timestamp to milliseconds for query range
+    let start_ms = (timestamp_secs - 60) * 1000; // 1 minute before
+    let end_ms = (timestamp_secs + 60) * 1000;   // 1 minute after
+
+    // Query minute bars around the specific timestamp using timestamp range
+    let url = format!(
+        "https://api.polygon.io/v2/aggs/ticker/{}/range/1/minute/{}/{}?sort=asc&limit=10&apiKey={}",
+        ticker, start_ms, end_ms, api_key
+    );
+
+    let resp = client.get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let results = data.get("results")?.as_array()?;
+
+    if results.is_empty() {
+        return None;
+    }
+
+    // Find the bar closest to our timestamp (in milliseconds)
+    let target_ms = timestamp_secs * 1000;
+    let bar = results.iter()
+        .min_by_key(|r| {
+            let t = r.get("t").and_then(|v| v.as_i64()).unwrap_or(0);
+            (t - target_ms).abs()
+        })?;
+
+    // Use open price as the strike
+    bar.get("o").and_then(|v| v.as_f64())
 }
 
 /// Parse expiry time and return minutes remaining
@@ -491,13 +576,13 @@ async fn run_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) {
 
         let (mut write, mut read) = ws.split();
 
-        // Subscribe to BTC and ETH
+        // Subscribe to BTC, ETH, SOL, XRP
         let sub = serde_json::json!({
             "action": "subscribe",
-            "params": "XT.BTC-USD,XT.ETH-USD"
+            "params": "XT.BTC-USD,XT.ETH-USD,XT.SOL-USD,XT.XRP-USD"
         });
         let _ = write.send(Message::Text(sub.to_string())).await;
-        info!("[POLYGON] Subscribed to BTC-USD, ETH-USD");
+        info!("[POLYGON] Subscribed to BTC-USD, ETH-USD, SOL-USD, XRP-USD");
 
         while let Some(msg) = read.next().await {
             match msg {
@@ -513,28 +598,14 @@ async fn run_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) {
                             let Some(price) = m.p else { continue };
 
                             let mut s = state.write().await;
-                            let old_price = if pair == "BTC-USD" {
-                                let old = s.prices.btc_price;
-                                s.prices.btc_price = Some(price);
-                                old
-                            } else if pair == "ETH-USD" {
-                                let old = s.prices.eth_price;
-                                s.prices.eth_price = Some(price);
-                                old
-                            } else {
-                                None
-                            };
-                            s.prices.last_update = Some(std::time::Instant::now());
-
-                            // Log price updates (only when changed significantly)
-                            if let Some(old) = old_price {
-                                let pct_change = ((price - old) / old * 100.0).abs();
-                                if pct_change > 0.01 {
-                                    info!("[PRICE] {} ${:.2} -> ${:.2} ({:+.3}%)", pair, old, price, (price - old) / old * 100.0);
-                                }
-                            } else {
-                                info!("[PRICE] {} initial: ${:.2}", pair, price);
+                            match pair.as_str() {
+                                "BTC-USD" => s.prices.btc_price = Some(price),
+                                "ETH-USD" => s.prices.eth_price = Some(price),
+                                "SOL-USD" => s.prices.sol_price = Some(price),
+                                "XRP-USD" => s.prices.xrp_price = Some(price),
+                                _ => {}
                             }
+                            s.prices.last_update = Some(std::time::Instant::now());
                         }
                     }
                 }
@@ -813,13 +884,22 @@ async fn main() -> Result<()> {
     let polygon_api_key = std::env::var("POLYGON_API_KEY")
         .unwrap_or_else(|_| "o2Jm26X52_0tRq2W7V5JbsCUXdMjL7qk".to_string());
 
+    // Validate private key format
+    let pk_len = private_key.len();
+    if pk_len < 64 || (pk_len == 66 && !private_key.starts_with("0x")) {
+        anyhow::bail!(
+            "POLY_PRIVATE_KEY appears invalid (length {}). Expected 64 hex chars or 66 with 0x prefix.",
+            pk_len
+        );
+    }
+
     // Initialize Polymarket client
     let poly_client = PolymarketAsyncClient::new(
         "https://clob.polymarket.com",
         137, // Polygon mainnet
         &private_key,
         &funder,
-    )?;
+    ).context("Failed to create Polymarket client - check POLY_PRIVATE_KEY is a valid hex private key")?;
 
     // Derive API credentials
     info!("[POLY] Deriving API credentials...");
@@ -835,7 +915,7 @@ async fn main() -> Result<()> {
 
     // Discover markets
     info!("[DISCOVER] Searching for crypto markets...");
-    let discovered = discover_markets(args.market.as_deref()).await?;
+    let discovered = discover_markets(args.market.as_deref(), &polygon_api_key).await?;
     info!("[DISCOVER] Found {} markets", discovered.len());
 
     for m in &discovered {
@@ -937,72 +1017,95 @@ async fn main() -> Result<()> {
                 }
 
                 _ = status_interval.tick() => {
+                    // First, check for markets that just started and need opening price captured
+                    let now_ts = Utc::now().timestamp();
+                    {
+                        let mut s = state.write().await;
+                        // Copy prices to avoid borrow issues
+                        let prices = s.prices.clone();
+                        for (_id, market) in s.markets.iter_mut() {
+                            // If market has started but doesn't have strike, capture current spot
+                            if market.strike.is_none() {
+                                if let Some(start_ts) = market.start_ts {
+                                    // If market just started (within last 60s), capture spot as strike
+                                    if start_ts <= now_ts && (now_ts - start_ts) < 60 {
+                                        let spot = match market.asset.as_str() {
+                                            "BTC" => prices.btc_price,
+                                            "ETH" => prices.eth_price,
+                                            "SOL" => prices.sol_price,
+                                            "XRP" => prices.xrp_price,
+                                            _ => None,
+                                        };
+                                        if let Some(price) = spot {
+                                            info!("[CAPTURE] {} market started - opening price: ${:.2}", market.asset, price);
+                                            market.strike = Some(price);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let s = state.read().await;
                     let spot_btc = s.prices.btc_price.map(|p| format!("{:.0}", p)).unwrap_or("-".into());
                     let spot_eth = s.prices.eth_price.map(|p| format!("{:.0}", p)).unwrap_or("-".into());
+                    let spot_sol = s.prices.sol_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
+                    let spot_xrp = s.prices.xrp_price.map(|p| format!("{:.3}", p)).unwrap_or("-".into());
 
-                    info!("[STATUS] BTC=${} ETH=${} | Poly: {} mkts | Kalshi: {} mkts",
-                          spot_btc, spot_eth, s.markets.len(), s.kalshi_markets.len());
+                    info!("[STATUS] BTC=${} ETH=${} SOL=${} XRP=${} | Poly: {} mkts | Kalshi: {} mkts",
+                          spot_btc, spot_eth, spot_sol, spot_xrp, s.markets.len(), s.kalshi_markets.len());
 
                     // Show Polymarket markets
-                    info!("───────────────────────────────────────────────────────────────────");
                     for (id, market) in &s.markets {
                         let pos = s.positions.get(id).cloned().unwrap_or_default();
 
                         // Get spot for this market's asset
                         let spot = match market.asset.as_str() {
-                            "ETH" => s.prices.eth_price,
                             "BTC" => s.prices.btc_price,
-                            _ => s.prices.btc_price, // SOL/XRP use BTC as proxy for now
+                            "ETH" => s.prices.eth_price,
+                            "SOL" => s.prices.sol_price,
+                            "XRP" => s.prices.xrp_price,
+                            _ => None,
                         };
 
                         // Calculate fair value if we have data
-                        let (fair_yes, fair_no, fair_source) = match (spot, market.strike, market.expiry_minutes) {
+                        // Strike is the opening price at start of 15m window
+                        let fair_value = match (spot, market.strike, market.expiry_minutes) {
                             (Some(s), Some(k), Some(mins)) if mins > 0.0 => {
-                                let (y, n) = calc_fair_value_cents(s, k, mins, vol);
-                                (y, n, format!("BS(spot={:.0},K={:.0},T={:.1}m)", s, k, mins))
+                                Some(calc_fair_value_cents(s, k, mins, vol))
                             }
-                            (None, Some(k), Some(mins)) => {
-                                (50, 50, format!("NO_SPOT(K={:.0},T={:.1}m)", k, mins))
-                            }
-                            (Some(s), None, Some(mins)) => {
-                                (50, 50, format!("NO_STRIKE(spot={:.0},T={:.1}m) - up/down mkt", s, mins))
-                            }
-                            (_, _, None) => {
-                                (50, 50, "NO_EXPIRY".to_string())
-                            }
-                            _ => (50, 50, "MISSING_DATA".to_string()),
+                            _ => None, // Missing strike or spot price
                         };
-
                         let yes_ask = market.yes_ask.unwrap_or(100);
                         let no_ask = market.no_ask.unwrap_or(100);
-                        let yes_bid = market.yes_bid.unwrap_or(0);
-                        let no_bid = market.no_bid.unwrap_or(0);
-                        let yes_edge = fair_yes - yes_ask;
-                        let no_edge = fair_no - no_ask;
 
-                        let edge_str = if yes_edge >= edge || no_edge >= edge {
-                            format!("🔥 EDGE Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
+                        if let Some((fair_yes, fair_no)) = fair_value {
+                            let yes_edge = fair_yes - yes_ask;
+                            let no_edge = fair_no - no_ask;
+
+                            let edge_str = if yes_edge >= edge || no_edge >= edge {
+                                format!("✓ EDGE Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
+                            } else {
+                                format!("Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
+                            };
+
+                            let strike_str = market.strike.map(|k| format!("${:.0}", k)).unwrap_or("-".into());
+                            info!("  [POLY] {} @ {} | Fair Y={}¢ N={}¢ | Mkt Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
+                                  market.asset, strike_str,
+                                  fair_yes, fair_no,
+                                  yes_ask, no_ask,
+                                  edge_str,
+                                  pos.yes_qty, pos.no_qty);
                         } else {
-                            format!("Y:{:+}¢ N:{:+}¢", yes_edge, no_edge)
-                        };
-
-                        // Truncate question for display
-                        let q_short = if market.question.len() > 50 {
-                            format!("{}...", &market.question[..47])
-                        } else {
-                            market.question.clone()
-                        };
-
-                        info!("  [{}] {}", market.asset, q_short);
-                        info!("      Book: Y={}/{} N={}/{} | Fair: Y={}¢ N={}¢ | {}",
-                              yes_bid, yes_ask, no_bid, no_ask,
-                              fair_yes, fair_no, edge_str);
-                        info!("      FV: {} | Pos: Y={:.1} N={:.1} | exp={:.1}m",
-                              fair_source, pos.yes_qty, pos.no_qty,
-                              market.expiry_minutes.unwrap_or(0.0));
+                            // Missing strike or spot price
+                            let strike_str = market.strike.map(|k| format!("${:.0}", k)).unwrap_or("NO STRIKE".into());
+                            let spot_str = spot.map(|_| "").unwrap_or(" (no spot)");
+                            info!("  [POLY] {} @ {}{} | Mkt Y={}¢ N={}¢ | Pos: Y={:.1} N={:.1}",
+                                  market.asset, strike_str, spot_str,
+                                  yes_ask, no_ask,
+                                  pos.yes_qty, pos.no_qty);
+                        }
                     }
-                    info!("───────────────────────────────────────────────────────────────────");
 
                     // Show Kalshi markets
                     for (ticker, kalshi) in &s.kalshi_markets {
@@ -1055,9 +1158,8 @@ async fn main() -> Result<()> {
                                         })
                                         .max_by_key(|(p, _)| *p);
 
-                                    // Get prices first
-                                    let btc_price = s.prices.btc_price;
-                                    let eth_price = s.prices.eth_price;
+                                    // Get prices first (copy all prices to avoid borrow issues)
+                                    let prices = s.prices.clone();
 
                                     // Now get mutable reference to market
                                     let Some(market) = s.markets.get_mut(&market_id) else { continue };
@@ -1084,128 +1186,97 @@ async fn main() -> Result<()> {
                                     let no_token = market.no_token.clone();
 
                                     // Get spot price based on asset
-                                    let spot = if asset == "ETH" { eth_price } else { btc_price };
+                                    let spot = match asset.as_str() {
+                                        "BTC" => prices.btc_price,
+                                        "ETH" => prices.eth_price,
+                                        "SOL" => prices.sol_price,
+                                        "XRP" => prices.xrp_price,
+                                        _ => None,
+                                    };
 
                                     drop(s);
 
-                                    // Calculate fair value
-                                    // For Up/Down markets (no strike), fair value is 50/50
-                                    // For above/below strike markets, use Black-Scholes
-                                    let (fair_yes, fair_no, skip_reason) = match (spot, strike, expiry) {
+                                    // Calculate fair value using Black-Scholes
+                                    // Strike is the opening price at start of 15m window
+                                    let (fair_yes, fair_no) = match (spot, strike, expiry) {
                                         (Some(s), Some(k), Some(mins)) if mins > 0.0 => {
-                                            let (y, n) = calc_fair_value_cents(s, k, mins, vol);
-                                            (y, n, None)
+                                            calc_fair_value_cents(s, k, mins, vol)
                                         }
-                                        (_, None, _) => (50, 50, Some("up/down market (no strike)")), // Up/Down markets = 50/50
-                                        (None, _, _) => (50, 50, Some("no spot price")),
-                                        (_, _, None) => (50, 50, Some("no expiry")),
-                                        (_, _, Some(mins)) if mins <= 0.0 => (50, 50, Some("expired")),
-                                        _ => (50, 50, Some("unknown")),
+                                        _ => continue, // Skip if missing data
                                     };
 
                                     // Check for edge
                                     let yes_edge_actual = yes_ask_price.map(|a| fair_yes - a).unwrap_or(0);
                                     let no_edge_actual = no_ask_price.map(|a| fair_no - a).unwrap_or(0);
 
-                                    // Log orderbook updates with edge info
-                                    let side = if is_yes { "YES" } else { "NO" };
-                                    let (ask_p, bid_p) = if is_yes {
-                                        (yes_ask_price, best_bid.map(|(p,_)| p))
-                                    } else {
-                                        (no_ask_price, best_bid.map(|(p,_)| p))
-                                    };
-
-                                    // Only log significant updates (when there's potential edge or book changed meaningfully)
-                                    let this_edge = if is_yes { yes_edge_actual } else { no_edge_actual };
-                                    if this_edge > 0 || skip_reason.is_some() {
-                                        info!("[BOOK] {} {} | ask={:?}¢ bid={:?}¢ | fair={}¢ | edge={:+}¢ | {}",
-                                              asset, side,
-                                              ask_p, bid_p,
-                                              if is_yes { fair_yes } else { fair_no },
-                                              this_edge,
-                                              skip_reason.unwrap_or("tradeable"));
-                                    }
-
                                     // Trade YES if edge
                                     if yes_edge_actual >= edge {
-                                        // Skip if this is an up/down market (no real edge calculation possible)
-                                        if skip_reason.is_some() {
-                                            info!("[SKIP] {} YES edge={}¢ but skipping: {}",
-                                                  asset, yes_edge_actual, skip_reason.unwrap());
-                                        } else {
-                                            let ask = yes_ask_price.unwrap();
-                                            let is_aggro = yes_edge_actual >= aggro_edge;
+                                        let ask = yes_ask_price.unwrap();
+                                        let is_aggro = yes_edge_actual >= aggro_edge;
 
-                                            if dry_run {
-                                                if is_aggro {
-                                                    warn!("[DRY] 🎯 Would IOC BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                          size, ask, fair_yes, yes_edge_actual, asset);
-                                                } else {
-                                                    warn!("[DRY] 🎯 Would BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                          size, ask, fair_yes, yes_edge_actual, asset);
-                                                }
-                                            } else {
-                                                let price = ask as f64 / 100.0;
-                                                let contracts = size / price;
-
-                                                warn!("[TRADE] 🎯 BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
+                                        if dry_run {
+                                            if is_aggro {
+                                                info!("[DRY] Would IOC BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
                                                       size, ask, fair_yes, yes_edge_actual, asset);
+                                            } else {
+                                                info!("[DRY] Would BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                      size, ask, fair_yes, yes_edge_actual, asset);
+                                            }
+                                        } else {
+                                            let price = ask as f64 / 100.0;
+                                            let contracts = size / price;
 
-                                                match shared_client.buy_fak(&yes_token, price, contracts).await {
-                                                    Ok(fill) => {
-                                                        warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
-                                                              fill.filled_size, fill.fill_cost, fill.order_id);
-                                                        // Update position
-                                                        let mut s = state.write().await;
-                                                        if let Some(pos) = s.positions.get_mut(&market_id) {
-                                                            pos.yes_qty += fill.filled_size;
-                                                            pos.yes_cost += fill.fill_cost;
-                                                        }
+                                            warn!("[TRADE] 🎯 BUY ${:.0} YES @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                  size, ask, fair_yes, yes_edge_actual, asset);
+
+                                            match shared_client.buy_fak(&yes_token, price, contracts).await {
+                                                Ok(fill) => {
+                                                    warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
+                                                          fill.filled_size, fill.fill_cost, fill.order_id);
+                                                    // Update position
+                                                    let mut s = state.write().await;
+                                                    if let Some(pos) = s.positions.get_mut(&market_id) {
+                                                        pos.yes_qty += fill.filled_size;
+                                                        pos.yes_cost += fill.fill_cost;
                                                     }
-                                                    Err(e) => error!("[TRADE] ❌ YES buy failed: {}", e),
                                                 }
+                                                Err(e) => error!("[TRADE] ❌ YES buy failed: {}", e),
                                             }
                                         }
                                     }
 
                                     // Trade NO if edge
                                     if no_edge_actual >= edge {
-                                        // Skip if this is an up/down market (no real edge calculation possible)
-                                        if skip_reason.is_some() {
-                                            info!("[SKIP] {} NO edge={}¢ but skipping: {}",
-                                                  asset, no_edge_actual, skip_reason.unwrap());
-                                        } else {
-                                            let Some(ask) = no_ask_price else { continue };
-                                            let is_aggro = no_edge_actual >= aggro_edge;
+                                        let Some(ask) = no_ask_price else { continue };
+                                        let is_aggro = no_edge_actual >= aggro_edge;
 
-                                            if dry_run {
-                                                if is_aggro {
-                                                    warn!("[DRY] 🎯 Would IOC BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                          size, ask, fair_no, no_edge_actual, asset);
-                                                } else {
-                                                    warn!("[DRY] 🎯 Would BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
-                                                          size, ask, fair_no, no_edge_actual, asset);
-                                                }
-                                            } else {
-                                                let price = ask as f64 / 100.0;
-                                                let contracts = size / price;
-
-                                                warn!("[TRADE] 🎯 BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
+                                        if dry_run {
+                                            if is_aggro {
+                                                info!("[DRY] Would IOC BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
                                                       size, ask, fair_no, no_edge_actual, asset);
+                                            } else {
+                                                info!("[DRY] Would BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                      size, ask, fair_no, no_edge_actual, asset);
+                                            }
+                                        } else {
+                                            let price = ask as f64 / 100.0;
+                                            let contracts = size / price;
 
-                                                match shared_client.buy_fak(&no_token, price, contracts).await {
-                                                    Ok(fill) => {
-                                                        warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
-                                                              fill.filled_size, fill.fill_cost, fill.order_id);
-                                                        // Update position
-                                                        let mut s = state.write().await;
-                                                        if let Some(pos) = s.positions.get_mut(&market_id) {
-                                                            pos.no_qty += fill.filled_size;
-                                                            pos.no_cost += fill.fill_cost;
-                                                        }
+                                            warn!("[TRADE] 🎯 BUY ${:.0} NO @{}¢ | fair={}¢ edge={}¢ | {}",
+                                                  size, ask, fair_no, no_edge_actual, asset);
+
+                                            match shared_client.buy_fak(&no_token, price, contracts).await {
+                                                Ok(fill) => {
+                                                    warn!("[TRADE] ✅ Filled {:.2} @${:.2} | order_id={}",
+                                                          fill.filled_size, fill.fill_cost, fill.order_id);
+                                                    // Update position
+                                                    let mut s = state.write().await;
+                                                    if let Some(pos) = s.positions.get_mut(&market_id) {
+                                                        pos.no_qty += fill.filled_size;
+                                                        pos.no_cost += fill.fill_cost;
                                                     }
-                                                    Err(e) => error!("[TRADE] ❌ NO buy failed: {}", e),
                                                 }
+                                                Err(e) => error!("[TRADE] ❌ NO buy failed: {}", e),
                                             }
                                         }
                                     }

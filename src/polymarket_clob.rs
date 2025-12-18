@@ -454,12 +454,13 @@ impl PolymarketAsyncClient {
         let url = format!("{}/auth/derive-api-key", self.host);
         let headers = self.build_l1_headers(nonce)?;
         let resp = self.http.get(&url).headers(headers).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
             return Err(anyhow!("derive-api-key failed: {} {}", status, body));
         }
-        Ok(resp.json().await?)
+        serde_json::from_str(&body)
+            .map_err(|e| anyhow!("derive-api-key JSON parse failed: {} | response: {}", e, body))
     }
 
     /// Build L2 headers for authenticated requests
