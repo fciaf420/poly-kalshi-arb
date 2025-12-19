@@ -494,10 +494,6 @@ impl PolymarketAsyncClient {
         let url = format!("{}{}", self.host, path);
         let headers = self.build_l2_headers("POST", path, Some(&body), creds)?;
 
-        tracing::info!("[POLY-ORDER] URL: {}", url);
-        tracing::info!("[POLY-ORDER] Headers: {:?}", headers);
-        tracing::info!("[POLY-ORDER] Body: {}", body);
-
         let resp = self.http
             .post(&url)
             .headers(headers)
