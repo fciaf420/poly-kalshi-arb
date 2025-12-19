@@ -629,11 +629,13 @@ impl SharedAsyncClient {
         let resp = self.inner.post_order_async(body, &self.creds).await?;
 
         if !resp.status().is_success() {
+            log::error!("request order failed: {}", resp.status());
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!("Polymarket order failed {}: {}", status, body));
         }
 
+        info!("resp {:?}", resp);
         let resp_json: serde_json::Value = resp.json().await?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
 
