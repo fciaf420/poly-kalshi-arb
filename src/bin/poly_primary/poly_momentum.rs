@@ -1,0 +1,1018 @@
+//! Polymarket Momentum Front-Runner
+//!
+//! STRATEGY:
+//! - Monitor real-time crypto prices via Polygon.io websocket
+//! - Detect rapid price movements (spikes/drops)
+//! - Front-run the market by buying YES (price up) or NO (price down)
+//! - Execute before market makers adjust their quotes
+//!
+//! The edge comes from:
+//! 1. Faster price feed than most participants
+//! 2. Quick execution via FAK orders
+//! 3. Market makers slow to adjust quotes after sudden moves
+//!
+//! Usage:
+//!   RUST_LOG=info cargo run --release --bin poly_momentum
+//!
+//! Environment:
+//!   POLY_PRIVATE_KEY - Your Polymarket/Polygon wallet private key
+//!   POLY_FUNDER - Your funder address (proxy wallet)
+//!   PRICEFEED_API_KEY - Polygon.io API key for price feed
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{error, info, warn};
+
+use arb_bot::polymarket_clob::{PolymarketAsyncClient, SharedAsyncClient, PreparedCreds};
+
+/// CLI Arguments
+#[derive(clap::Parser, Debug)]
+#[command(author, version, about = "Polymarket Momentum Front-Runner")]
+struct Args {
+    /// Number of contracts per trade
+    #[arg(short = 'c', long, default_value_t = 1.0)]
+    contracts: f64,
+
+    /// Price move threshold in basis points per tick (default: 5 = 0.05%)
+    #[arg(short, long, default_value_t = 3)]
+    threshold_bps: i64,
+
+    /// Minimum edge in cents vs market price (default: 3)
+    #[arg(short, long, default_value_t = 3)]
+    edge: i64,
+
+    /// Live trading mode (default is dry run)
+    #[arg(short, long, default_value_t = false)]
+    live: bool,
+
+    /// Specific symbol to trade (BTC, ETH, SOL, XRP) - trades all if not set
+    #[arg(long)]
+    sym: Option<String>,
+
+    /// Connect directly to Polygon.io instead of local price server
+    #[arg(short, long, default_value_t = false)]
+    direct: bool,
+}
+
+const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
+const PRICEFEED_WS_URL: &str = "wss://socket.polygon.io/crypto";
+const LOCAL_PRICE_SERVER: &str = "ws://127.0.0.1:9999";
+
+/// Price tracking for momentum detection
+#[derive(Debug, Default)]
+struct PriceTracker {
+    last_price: Option<f64>,
+    last_signal_time: Option<Instant>,
+    last_signal_direction: Option<Direction>,
+}
+
+impl PriceTracker {
+    /// Update price and return change in basis points from previous tick
+    fn update(&mut self, price: f64) -> Option<i64> {
+        let change_bps = self.last_price.map(|old| {
+            ((price - old) / old * 10000.0).round() as i64
+        });
+        self.last_price = Some(price);
+        change_bps
+    }
+}
+
+/// Market state
+#[derive(Debug, Clone)]
+struct Market {
+    condition_id: String,
+    question: String,
+    yes_token: String,
+    no_token: String,
+    asset: String,
+    expiry_minutes: Option<f64>,
+    // Orderbook
+    yes_ask: Option<i64>,
+    yes_bid: Option<i64>,
+    no_ask: Option<i64>,
+    no_bid: Option<i64>,
+    // Trading state
+    last_trade_time: Option<Instant>,
+}
+
+/// Global state
+struct State {
+    markets: HashMap<String, Market>,
+    price_trackers: HashMap<String, PriceTracker>, // asset -> tracker
+    pending_signals: Vec<MomentumSignal>,
+    // Track open positions for quick exit
+    open_positions: Vec<OpenPosition>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenPosition {
+    asset: String,
+    token_id: String,
+    side: &'static str, // "YES" or "NO"
+    entry_price: i64,   // cents
+    size: f64,
+    opened_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct MomentumSignal {
+    asset: String,
+    direction: Direction,
+    move_bps: i64,
+    triggered_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum Direction {
+    #[default]
+    Up,
+    Down,
+}
+
+impl State {
+    fn new() -> Self {
+        let mut price_trackers = HashMap::new();
+        for asset in ["BTC", "ETH", "SOL", "XRP"] {
+            price_trackers.insert(asset.to_string(), PriceTracker::default());
+        }
+
+        Self {
+            markets: HashMap::new(),
+            price_trackers,
+            pending_signals: Vec::new(),
+            open_positions: Vec::new(),
+        }
+    }
+}
+
+// === Gamma API for market discovery ===
+
+#[derive(Debug, Deserialize)]
+struct GammaSeries {
+    events: Option<Vec<GammaEvent>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GammaEvent {
+    slug: Option<String>,
+    closed: Option<bool>,
+    #[serde(rename = "enableOrderBook")]
+    enable_order_book: Option<bool>,
+}
+
+const POLY_SERIES_SLUGS: &[(&str, &str)] = &[
+    ("btc-up-or-down-15m", "BTC"),
+    ("eth-up-or-down-15m", "ETH"),
+    ("sol-up-or-down-15m", "SOL"),
+    ("xrp-up-or-down-15m", "XRP"),
+];
+
+/// Discover the soonest expiring market for each asset
+async fn discover_markets(asset_filter: Option<&str>) -> Result<Vec<Market>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let mut markets = Vec::new();
+
+    let series_to_check: Vec<(&str, &str)> = if let Some(filter) = asset_filter {
+        let filter_upper = filter.to_uppercase();
+        POLY_SERIES_SLUGS
+            .iter()
+            .filter(|(_, asset)| *asset == filter_upper)
+            .copied()
+            .collect()
+    } else {
+        POLY_SERIES_SLUGS.to_vec()
+    };
+
+    for (series_slug, asset) in series_to_check {
+        let url = format!("{}/series?slug={}", GAMMA_API_BASE, series_slug);
+
+        let resp = client.get(&url)
+            .header("User-Agent", "poly_momentum/1.0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            warn!("[poly_momentum] Failed to fetch series '{}': {}", series_slug, resp.status());
+            continue;
+        }
+
+        let series_list: Vec<GammaSeries> = resp.json().await?;
+        let Some(series) = series_list.first() else { continue };
+        let Some(events) = &series.events else { continue };
+
+        // Get first active event with orderbook
+        let event_slugs: Vec<String> = events
+            .iter()
+            .filter(|e| e.closed != Some(true) && e.enable_order_book == Some(true))
+            .filter_map(|e| e.slug.clone())
+            .take(3) // Only need soonest few
+            .collect();
+
+        for event_slug in event_slugs {
+            let event_url = format!("{}/events?slug={}", GAMMA_API_BASE, event_slug);
+            let resp = match client.get(&event_url)
+                .header("User-Agent", "poly_momentum/1.0")
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let event_details: Vec<serde_json::Value> = match resp.json().await {
+                Ok(ed) => ed,
+                Err(_) => continue,
+            };
+
+            let Some(ed) = event_details.first() else { continue };
+            let Some(mkts) = ed.get("markets").and_then(|m| m.as_array()) else { continue };
+
+            for mkt in mkts {
+                let condition_id = mkt.get("conditionId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let clob_tokens_str = mkt.get("clobTokenIds")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let question = mkt.get("question")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| event_slug.clone());
+                let end_date_str = mkt.get("endDate")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let Some(cid) = condition_id else { continue };
+                let Some(cts) = clob_tokens_str else { continue };
+
+                let token_ids: Vec<String> = serde_json::from_str(&cts).unwrap_or_default();
+                if token_ids.len() < 2 {
+                    continue;
+                }
+
+                let expiry_minutes = end_date_str.as_ref().and_then(|d| {
+                    let dt = chrono::DateTime::parse_from_rfc3339(d).ok()?;
+                    let now = Utc::now();
+                    let diff = dt.signed_duration_since(now);
+                    let mins = diff.num_minutes() as f64;
+                    if mins > 0.0 { Some(mins) } else { None }
+                });
+
+                // Skip expired markets
+                if expiry_minutes.is_none() {
+                    continue;
+                }
+
+                markets.push(Market {
+                    condition_id: cid,
+                    question,
+                    yes_token: token_ids[0].clone(),
+                    no_token: token_ids[1].clone(),
+                    asset: asset.to_string(),
+                    expiry_minutes,
+                    yes_ask: None,
+                    yes_bid: None,
+                    no_ask: None,
+                    no_bid: None,
+                    last_trade_time: None,
+                });
+            }
+        }
+    }
+
+    // Keep only soonest market per asset
+    let mut best_per_asset: HashMap<String, Market> = HashMap::new();
+    for market in markets {
+        let expiry = market.expiry_minutes.unwrap_or(f64::MAX);
+        let existing = best_per_asset.get(&market.asset);
+        if existing.is_none() || existing.unwrap().expiry_minutes.unwrap_or(f64::MAX) > expiry {
+            best_per_asset.insert(market.asset.clone(), market);
+        }
+    }
+
+    Ok(best_per_asset.into_values().collect())
+}
+
+// === Price Feed Messages ===
+
+#[derive(Deserialize, Debug)]
+struct PriceFeedMessage {
+    btc_price: Option<f64>,
+    eth_price: Option<f64>,
+    sol_price: Option<f64>,
+    xrp_price: Option<f64>,
+    timestamp: Option<u64>,
+}
+
+// Polygon.io message types
+#[derive(Serialize, Debug)]
+struct PolygonAuth {
+    action: &'static str,
+    params: String,
+}
+
+#[derive(Serialize, Debug)]
+struct PolygonSubscribe {
+    action: &'static str,
+    params: &'static str,
+}
+
+#[derive(Deserialize, Debug)]
+struct PolygonStatus {
+    status: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PolygonTrade {
+    ev: Option<String>,
+    pair: Option<String>,
+    p: Option<f64>,
+}
+
+/// Run local price server feed and detect momentum signals
+async fn run_price_feed(
+    state: Arc<RwLock<State>>,
+    threshold_bps: i64,
+) {
+    loop {
+        info!("[poly_momentum] Connecting to local price server...");
+
+        let ws = match connect_async(LOCAL_PRICE_SERVER).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                error!("[poly_momentum] Connect failed: {} - is price server running?", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let (mut write, mut read) = ws.split();
+        info!("[poly_momentum] Connected to local price server");
+
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        error!("[poly_momentum] Ping failed: {}", e);
+                        break;
+                    }
+                }
+
+                msg = read.next() => {
+                    let Some(msg) = msg else { break; };
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            // Parse local price server format
+                            tracing::debug!("[ws] Received: {}", &text[..text.len().min(200)]);
+                            match serde_json::from_str::<PriceFeedMessage>(&text) {
+                                Ok(msg) => {
+                                // Process each available price
+                                let prices: Vec<(&str, Option<f64>)> = vec![
+                                    ("BTC", msg.btc_price),
+                                    ("ETH", msg.eth_price),
+                                    ("SOL", msg.sol_price),
+                                    ("XRP", msg.xrp_price),
+                                ];
+
+                                let mut s = state.write().await;
+
+                                for (asset, price_opt) in prices {
+                                    let Some(price) = price_opt else { continue };
+
+                                    // Update price and get tick-to-tick change
+                                    if let Some(tracker) = s.price_trackers.get_mut(asset) {
+                                        if let Some(change_bps) = tracker.update(price) {
+                                            // Log all price updates at debug level
+                                            if change_bps != 0 {
+                                                tracing::debug!("[price] {} ${:.2} ({:+}bps)", asset, price, change_bps);
+                                            }
+
+                                            // React to any significant tick movement
+                                            if change_bps.abs() >= threshold_bps {
+                                                let direction = if change_bps > 0 {
+                                                    Direction::Up
+                                                } else {
+                                                    Direction::Down
+                                                };
+
+                                                // Signal immediately on significant move
+                                                // Only cooldown: 100ms to prevent duplicate signals on same move
+                                                let should_signal = tracker.last_signal_time
+                                                    .map(|t| t.elapsed() >= Duration::from_millis(100))
+                                                    .unwrap_or(true);
+
+                                                if should_signal {
+                                                    warn!("[poly_momentum] {} {:?} {}bps ${:.2}",
+                                                          asset, direction, change_bps.abs(), price);
+
+                                                    tracker.last_signal_time = Some(Instant::now());
+                                                    tracker.last_signal_direction = Some(direction);
+
+                                                    s.pending_signals.push(MomentumSignal {
+                                                        asset: asset.to_string(),
+                                                        direction,
+                                                        move_bps: change_bps,
+                                                        triggered_at: Instant::now(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                }
+                                Err(e) => {
+                                    tracing::debug!("[ws] Parse error: {} - msg: {}", e, &text[..text.len().min(100)]);
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Err(e) => {
+                            error!("[poly_momentum] WebSocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        warn!("[poly_momentum] Disconnected, reconnecting in 2s...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Run direct Polygon.io price feed (no local server needed)
+async fn run_direct_price_feed(
+    state: Arc<RwLock<State>>,
+    threshold_bps: i64,
+    api_key: String,
+) {
+    loop {
+        info!("[poly_momentum] Connecting directly to Polygon.io...");
+
+        let ws = match connect_async(PRICEFEED_WS_URL).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                error!("[poly_momentum] Polygon.io connect failed: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let (mut write, mut read) = ws.split();
+        info!("[poly_momentum] Connected to Polygon.io, authenticating...");
+
+        // Authenticate
+        let auth = PolygonAuth {
+            action: "auth",
+            params: api_key.clone(),
+        };
+        if let Err(e) = write.send(Message::Text(serde_json::to_string(&auth).unwrap())).await {
+            error!("[poly_momentum] Auth send failed: {}", e);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        // Wait for auth response
+        let mut authenticated = false;
+        while let Some(msg) = read.next().await {
+            if let Ok(Message::Text(text)) = msg {
+                if let Ok(statuses) = serde_json::from_str::<Vec<PolygonStatus>>(&text) {
+                    if let Some(s) = statuses.first() {
+                        if s.status.as_deref() == Some("auth_success") {
+                            info!("[poly_momentum] Polygon.io authenticated");
+                            authenticated = true;
+                            break;
+                        } else if s.status.as_deref() == Some("auth_failed") {
+                            error!("[poly_momentum] Polygon.io auth failed: {:?}", s.message);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !authenticated {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        // Subscribe to crypto trades
+        let subscribe = PolygonSubscribe {
+            action: "subscribe",
+            params: "XT.BTC-USD,XT.ETH-USD,XT.SOL-USD,XT.XRP-USD",
+        };
+        if let Err(e) = write.send(Message::Text(serde_json::to_string(&subscribe).unwrap())).await {
+            error!("[poly_momentum] Subscribe failed: {}", e);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        info!("[poly_momentum] Subscribed to BTC, ETH, SOL, XRP trades");
+
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        error!("[poly_momentum] Ping failed: {}", e);
+                        break;
+                    }
+                }
+
+                msg = read.next() => {
+                    let Some(msg) = msg else { break; };
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            // Parse Polygon.io trade messages
+                            if let Ok(trades) = serde_json::from_str::<Vec<PolygonTrade>>(&text) {
+                                let mut s = state.write().await;
+
+                                for trade in trades {
+                                    if trade.ev.as_deref() != Some("XT") {
+                                        continue;
+                                    }
+
+                                    let Some(pair) = &trade.pair else { continue };
+                                    let Some(price) = trade.p else { continue };
+
+                                    let asset = match pair.as_str() {
+                                        "BTC-USD" => "BTC",
+                                        "ETH-USD" => "ETH",
+                                        "SOL-USD" => "SOL",
+                                        "XRP-USD" => "XRP",
+                                        _ => continue,
+                                    };
+
+                                    // Update price and get tick-to-tick change
+                                    if let Some(tracker) = s.price_trackers.get_mut(asset) {
+                                        if let Some(change_bps) = tracker.update(price) {
+                                            if change_bps != 0 {
+                                                tracing::debug!("[price] {} ${:.2} ({:+}bps)", asset, price, change_bps);
+                                            }
+
+                                            // React to any significant tick movement
+                                            if change_bps.abs() >= threshold_bps {
+                                                let direction = if change_bps > 0 {
+                                                    Direction::Up
+                                                } else {
+                                                    Direction::Down
+                                                };
+
+                                                let should_signal = tracker.last_signal_time
+                                                    .map(|t| t.elapsed() >= Duration::from_millis(100))
+                                                    .unwrap_or(true);
+
+                                                if should_signal {
+                                                    warn!("[poly_momentum] {} {:?} {}bps ${:.2}",
+                                                          asset, direction, change_bps.abs(), price);
+
+                                                    tracker.last_signal_time = Some(Instant::now());
+                                                    tracker.last_signal_direction = Some(direction);
+
+                                                    s.pending_signals.push(MomentumSignal {
+                                                        asset: asset.to_string(),
+                                                        direction,
+                                                        move_bps: change_bps,
+                                                        triggered_at: Instant::now(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Err(e) => {
+                            error!("[poly_momentum] WebSocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        warn!("[poly_momentum] Disconnected from Polygon.io, reconnecting in 2s...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+// === Polymarket WebSocket ===
+
+#[derive(Deserialize, Debug)]
+struct BookSnapshot {
+    asset_id: String,
+    bids: Vec<PriceLevel>,
+    asks: Vec<PriceLevel>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PriceLevel {
+    price: String,
+    size: String,
+}
+
+#[derive(Serialize)]
+struct SubscribeCmd {
+    assets_ids: Vec<String>,
+    #[serde(rename = "type")]
+    sub_type: &'static str,
+}
+
+fn parse_price_cents(s: &str) -> i64 {
+    s.parse::<f64>()
+        .map(|p| (p * 100.0).round() as i64)
+        .unwrap_or(0)
+}
+
+// === Main ===
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    use clap::Parser;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("poly_momentum=info,arb_bot=info")
+                }),
+        )
+        .with_target(false)
+        .init();
+
+    let args = Args::parse();
+
+    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
+    info!("[poly_momentum] 🚀 POLYMARKET MOMENTUM FRONT-RUNNER");
+    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
+    info!("[poly_momentum] STRATEGY:");
+    info!("[poly_momentum]    1. Detect instant price moves (>{}bps per tick)", args.threshold_bps);
+    info!("[poly_momentum]    2. Buy YES on up moves, NO on down moves");
+    info!("[poly_momentum]    3. Front-run slow market makers");
+    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
+    info!("[poly_momentum] CONFIG:");
+    info!("[poly_momentum]    Mode: {}", if args.live { "🔴 LIVE" } else { "🔍 DRY RUN" });
+    info!("[poly_momentum]    Price Feed: {}", if args.direct { "Direct Polygon.io" } else { "Local server (ws://127.0.0.1:9999)" });
+    info!("[poly_momentum]    Contracts: {:.1} per trade", args.contracts);
+    info!("[poly_momentum]    Threshold: {}bps per tick ({}%)", args.threshold_bps, args.threshold_bps as f64 / 100.0);
+    info!("[poly_momentum]    Min Edge: {}¢", args.edge);
+    if let Some(ref sym) = args.sym {
+        info!("[poly_momentum]    Symbol: {}", sym);
+    }
+    info!("[poly_momentum] ═══════════════════════════════════════════════════════════════");
+
+    // Load credentials from project root .env
+    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let env_path = project_root.join(".env");
+    if env_path.exists() {
+        dotenvy::from_path(&env_path).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
+
+    let private_key = std::env::var("POLY_PRIVATE_KEY")
+        .context("POLY_PRIVATE_KEY not set")?;
+    let funder = std::env::var("POLY_FUNDER")
+        .context("POLY_FUNDER not set")?;
+
+    // Validate private key format
+    let pk_len = private_key.len();
+    if pk_len < 64 || (pk_len == 66 && !private_key.starts_with("0x")) {
+        anyhow::bail!(
+            "POLY_PRIVATE_KEY appears invalid (length {}). Expected 64 hex chars or 66 with 0x prefix.",
+            pk_len
+        );
+    }
+
+    // Validate funder address format
+    let funder_len = funder.len();
+    if funder_len != 42 || !funder.starts_with("0x") {
+        anyhow::bail!(
+            "POLY_FUNDER appears invalid (length {}). Expected 42 chars with 0x prefix (e.g., 0x123...abc).",
+            funder_len
+        );
+    }
+
+    info!("[poly_momentum] Credentials: pk_len={}, funder_len={}", pk_len, funder_len);
+    info!("[poly_momentum] Funder: {}", funder);
+
+    // Initialize Polymarket client
+    let poly_client = PolymarketAsyncClient::new(
+        "https://clob.polymarket.com",
+        137,
+        &private_key,
+        &funder,
+    ).context("Failed to create Polymarket client")?;
+
+    info!("[poly_momentum] Wallet: {}", poly_client.wallet_address());
+    info!("[poly_momentum] Deriving API credentials...");
+    let api_creds = poly_client.derive_api_key(0).await
+        .context("derive_api_key failed - check wallet/funder addresses")?;
+    let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
+    let shared_client = Arc::new(SharedAsyncClient::new(poly_client, prepared_creds, 137));
+    info!("[poly_momentum] API credentials ready");
+
+    if args.live {
+        warn!("⚠️  LIVE MODE - Real money at risk!");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Discover markets
+    info!("[poly_momentum] Searching for markets...");
+    let discovered = discover_markets(args.sym.as_deref()).await?;
+    info!("[poly_momentum] Found {} markets", discovered.len());
+
+    for m in &discovered {
+        info!("  • {} | {} | Expiry: {:.1?}min",
+              m.asset,
+              &m.question[..m.question.len().min(50)],
+              m.expiry_minutes);
+    }
+
+    if discovered.is_empty() {
+        warn!("No markets found!");
+        return Ok(());
+    }
+
+    // Initialize state
+    let state = Arc::new(RwLock::new({
+        let mut s = State::new();
+        for m in discovered {
+            let id = m.condition_id.clone();
+            s.markets.insert(id, m);
+        }
+        s
+    }));
+
+    // Start price feed with momentum detection
+    let state_price = state.clone();
+    let threshold = args.threshold_bps;
+    let use_direct = args.direct;
+
+    if use_direct {
+        // Get Polygon API key for direct connection
+        let polygon_key = std::env::var("POLYGON_KEY")
+            .or_else(|_| std::env::var("POLYGON_API_KEY"))
+            .or_else(|_| std::env::var("PRICEFEED_API_KEY"))
+            .context("POLYGON_KEY or PRICEFEED_API_KEY not set (required for --direct)")?;
+
+        tokio::spawn(async move {
+            run_direct_price_feed(state_price, threshold, polygon_key).await;
+        });
+    } else {
+        tokio::spawn(async move {
+            run_price_feed(state_price, threshold).await;
+        });
+    }
+
+    // Get token IDs for subscription
+    let tokens: Vec<String> = {
+        let s = state.read().await;
+        s.markets.values()
+            .flat_map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
+            .collect()
+    };
+
+    let edge_threshold = args.edge;
+    let contracts = args.contracts;
+    let dry_run = !args.live;
+
+    // Main WebSocket loop
+    loop {
+        info!("[poly_momentum] Connecting to Polymarket...");
+
+        let (ws, _) = match connect_async(POLYMARKET_WS_URL).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                error!("[poly_momentum] Connect failed: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let (mut write, mut read) = ws.split();
+
+        // Subscribe
+        let sub = SubscribeCmd {
+            assets_ids: tokens.clone(),
+            sub_type: "market",
+        };
+        let _ = write.send(Message::Text(serde_json::to_string(&sub)?)).await;
+        info!("[poly_momentum] Subscribed to {} tokens", tokens.len());
+
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        let mut signal_check = tokio::time::interval(Duration::from_millis(100));
+        let mut status_interval = tokio::time::interval(Duration::from_secs(10));
+
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        error!("[poly_momentum] Ping failed: {}", e);
+                        break;
+                    }
+                }
+
+                _ = status_interval.tick() => {
+                    // Print periodic status
+                    let s = state.read().await;
+                    let mut status_parts: Vec<String> = Vec::new();
+
+                    for asset in ["BTC", "ETH", "SOL", "XRP"] {
+                        if let Some(tracker) = s.price_trackers.get(asset) {
+                            if let Some(price) = tracker.last_price {
+                                // Find market for this asset
+                                if let Some(market) = s.markets.values().find(|m| m.asset == asset) {
+                                    let yes_ask = market.yes_ask.map(|a| format!("{}¢", a)).unwrap_or_else(|| "-".to_string());
+                                    let no_ask = market.no_ask.map(|a| format!("{}¢", a)).unwrap_or_else(|| "-".to_string());
+                                    status_parts.push(format!("{}: ${:.2} Y={} N={}", asset, price, yes_ask, no_ask));
+                                } else {
+                                    status_parts.push(format!("{}: ${:.2}", asset, price));
+                                }
+                            }
+                        }
+                    }
+
+                    if !status_parts.is_empty() {
+                        info!("[status] {}", status_parts.join(" | "));
+                    } else {
+                        info!("[status] Waiting for data...");
+                    }
+                }
+
+                _ = signal_check.tick() => {
+                    // Process pending momentum signals
+                    let mut s = state.write().await;
+
+                    // Remove stale signals (>5s old)
+                    s.pending_signals.retain(|sig| sig.triggered_at.elapsed() < Duration::from_secs(5));
+
+                    // Process signals
+                    let signals: Vec<MomentumSignal> = s.pending_signals.drain(..).collect();
+
+                    for signal in signals {
+                        // Find market for this asset
+                        let market_entry = s.markets.iter_mut()
+                            .find(|(_, m)| m.asset == signal.asset);
+
+                        let Some((market_id, market)) = market_entry else {
+                            continue;
+                        };
+
+                        // Determine which side to buy
+                        let (buy_token, buy_side, ask_price) = match signal.direction {
+                            Direction::Up => {
+                                // Price went up, buy YES
+                                (&market.yes_token, "YES", market.yes_ask)
+                            }
+                            Direction::Down => {
+                                // Price went down, buy NO
+                                (&market.no_token, "NO", market.no_ask)
+                            }
+                        };
+
+                        let Some(ask) = ask_price else {
+                            warn!("[poly_momentum] {} {} - no ask price", signal.asset, buy_side);
+                            continue;
+                        };
+
+                        // For momentum trades, we expect fair value to be moving
+                        // If price moved up 15bps, YES should be worth more than 50¢
+                        // Rough estimate: each 10bps move = ~1¢ edge in short-term
+                        let estimated_fair = 50 + (signal.move_bps.abs() / 10) as i64;
+                        let edge = estimated_fair - ask;
+
+                        if edge < edge_threshold {
+                            info!("[poly_momentum] {} {} - edge {}¢ < {}¢ threshold (ask={}¢, est_fair={}¢)",
+                                  signal.asset, buy_side, edge, edge_threshold, ask, estimated_fair);
+                            continue;
+                        }
+
+                        let market_id_clone = market_id.clone();
+                        let buy_token_clone = buy_token.clone();
+
+                        let price = ask as f64 / 100.0;
+                        let cost = contracts * price;
+
+                        if dry_run {
+                            warn!("[poly_momentum] 🎯 Would BUY {:.1} {} {} @{}¢ (${:.2}) | move={}bps | edge={}¢",
+                                  contracts, signal.asset, buy_side, ask, cost, signal.move_bps.abs(), edge);
+                            market.last_trade_time = Some(Instant::now());
+                        } else {
+                            warn!("[poly_momentum] 🎯 BUY {:.1} {} {} @{}¢ (${:.2}) | move={}bps | edge={}¢",
+                                  contracts, signal.asset, buy_side, ask, cost, signal.move_bps.abs(), edge);
+
+                            let client = shared_client.clone();
+                            let state_clone = state.clone();
+
+                            // Execute trade asynchronously
+                            tokio::spawn(async move {
+                                match client.buy_fak(&buy_token_clone, price, contracts).await {
+                                    Ok(fill) => {
+                                        warn!("[poly_momentum] ✅ Filled {:.2} @${:.2} | order_id={}",
+                                              fill.filled_size, fill.fill_cost, fill.order_id);
+
+                                        let mut s = state_clone.write().await;
+                                        if let Some(m) = s.markets.get_mut(&market_id_clone) {
+                                            m.last_trade_time = Some(Instant::now());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("[poly_momentum] ❌ Buy failed: {}", e);
+                                    }
+                                }
+                            });
+
+                            market.last_trade_time = Some(Instant::now());
+                        }
+                    }
+                }
+
+                msg = read.next() => {
+                    let Some(msg) = msg else { break; };
+
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            // Update orderbook
+                            if let Ok(books) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
+                                let mut s = state.write().await;
+
+                                for book in books {
+                                    // Find market
+                                    let market = s.markets.values_mut()
+                                        .find(|m| m.yes_token == book.asset_id || m.no_token == book.asset_id);
+
+                                    let Some(market) = market else { continue };
+
+                                    let best_ask = book.asks.iter()
+                                        .filter_map(|l| {
+                                            let price = parse_price_cents(&l.price);
+                                            if price > 0 { Some(price) } else { None }
+                                        })
+                                        .min();
+
+                                    let best_bid = book.bids.iter()
+                                        .filter_map(|l| {
+                                            let price = parse_price_cents(&l.price);
+                                            if price > 0 { Some(price) } else { None }
+                                        })
+                                        .max();
+
+                                    let is_yes = book.asset_id == market.yes_token;
+
+                                    let side = if is_yes { "YES" } else { "NO" };
+                                    let old_ask = if is_yes { market.yes_ask } else { market.no_ask };
+                                    let old_bid = if is_yes { market.yes_bid } else { market.no_bid };
+
+                                    if is_yes {
+                                        market.yes_ask = best_ask;
+                                        market.yes_bid = best_bid;
+                                    } else {
+                                        market.no_ask = best_ask;
+                                        market.no_bid = best_bid;
+                                    }
+
+                                    // Log orderbook updates when prices change
+                                    if best_ask != old_ask || best_bid != old_bid {
+                                        tracing::debug!("[book] {} {} bid={:?}¢ ask={:?}¢",
+                                            market.asset, side, best_bid, best_ask);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Ok(Message::Close(_)) | Err(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        info!("[poly_momentum] Disconnected, reconnecting in 3s...");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}

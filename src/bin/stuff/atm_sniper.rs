@@ -320,6 +320,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Load .env file for API credentials
+    dotenvy::dotenv().ok();
+
     info!("════════════════════════════════════════════════════════════════════════");
     info!("🎯 ATM SNIPER - Fair Value Based Strategy");
     // Parse CLI args

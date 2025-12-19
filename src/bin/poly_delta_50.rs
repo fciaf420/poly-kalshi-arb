@@ -10,7 +10,7 @@
 //! meaning both YES and NO have approximately equal fair value (50¢).
 //!
 //! Usage:
-//!   cargo run --release --bin poly_atm_sniper
+//!   cargo run --release --bin delta_50
 //!
 //! Environment:
 //!   POLY_PRIVATE_KEY - Your Polymarket/Polygon wallet private key
@@ -37,9 +37,9 @@ use arb_bot::polymarket_clob::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Size per trade in dollars
-    #[arg(short, long, default_value_t = 20.0)]
-    size: f64,
+    /// Number of contracts to buy per side
+    #[arg(short, long, default_value_t = 50.0)]
+    contracts: f64,
 
     /// Max bid price in cents (bid at this or lower when ATM)
     #[arg(short, long, default_value_t = 45)]
@@ -58,6 +58,10 @@ struct Args {
     #[arg(long)]
     market: Option<String>,
 
+    /// Symbol to trade: BTC or ETH (trades both if not set)
+    #[arg(long)]
+    symbol: Option<String>,
+
     /// Minimum minutes remaining to trade (default: 2)
     #[arg(long, default_value_t = 2)]
     min_minutes: i64,
@@ -65,11 +69,16 @@ struct Args {
     /// Maximum minutes remaining to trade (default: 15)
     #[arg(long, default_value_t = 15)]
     max_minutes: i64,
+
+    /// Quiet mode - only log orders (default: false)
+    #[arg(short, long, default_value_t = false)]
+    quiet: bool,
 }
 
 const POLYMARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const POLYGON_WS_URL: &str = "wss://socket.polygon.io/crypto";
+const LOCAL_PRICE_SERVER: &str = "ws://127.0.0.1:9999";
 
 /// Market state
 #[derive(Debug, Clone)]
@@ -217,7 +226,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
 
         let resp = client
             .get(&url)
-            .header("User-Agent", "poly_atm_sniper/1.0")
+            .header("User-Agent", "delta_50/1.0")
             .send()
             .await?;
 
@@ -242,7 +251,7 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
         for event_slug in event_slugs {
             let event_url = format!("{}/events?slug={}", GAMMA_API_BASE, event_slug);
             let resp = match client.get(&event_url)
-                .header("User-Agent", "poly_atm_sniper/1.0")
+                .header("User-Agent", "delta_50/1.0")
                 .send()
                 .await
             {
@@ -395,7 +404,7 @@ fn parse_size(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(0.0)
 }
 
-// === Polygon Price Feed ===
+// === Price Feed (local server or direct Polygon) ===
 
 #[derive(Deserialize, Debug)]
 struct PolygonMessage {
@@ -404,66 +413,115 @@ struct PolygonMessage {
     p: Option<f64>,
 }
 
+#[derive(Deserialize, Debug)]
+struct LocalPriceUpdate {
+    btc_price: Option<f64>,
+    eth_price: Option<f64>,
+}
+
+/// Try local price server first, fallback to direct Polygon
 async fn run_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) {
     loop {
-        info!("[POLYGON] Connecting to price feed...");
-
-        let url = format!("{}?apiKey={}", POLYGON_WS_URL, api_key);
-        let ws = match connect_async(&url).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                error!("[POLYGON] Connect failed: {}", e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+        // Try local price server first
+        info!("[PRICES] Trying local price server {}...", LOCAL_PRICE_SERVER);
+        match connect_async(LOCAL_PRICE_SERVER).await {
+            Ok((ws, _)) => {
+                info!("[PRICES] ✅ Connected to local price server");
+                if run_local_price_feed(state.clone(), ws).await.is_err() {
+                    warn!("[PRICES] Local server disconnected");
+                }
             }
-        };
-
-        let (mut write, mut read) = ws.split();
-
-        // Subscribe to BTC and ETH
-        let sub = serde_json::json!({
-            "action": "subscribe",
-            "params": "XT.BTC-USD,XT.ETH-USD"
-        });
-        let _ = write.send(Message::Text(sub.to_string())).await;
-        info!("[POLYGON] Subscribed to BTC-USD, ETH-USD");
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Ok(messages) = serde_json::from_str::<Vec<PolygonMessage>>(&text) {
-                        for m in messages {
-                            if m.ev.as_deref() != Some("XT") {
-                                continue;
-                            }
-
-                            let Some(pair) = m.pair.as_ref() else { continue };
-                            let Some(price) = m.p else { continue };
-
-                            let mut s = state.write().await;
-                            if pair == "BTC-USD" {
-                                s.prices.btc_price = Some(price);
-                            } else if pair == "ETH-USD" {
-                                s.prices.eth_price = Some(price);
-                            }
-                            s.prices.last_update = Some(std::time::Instant::now());
-                        }
-                    }
+            Err(_) => {
+                info!("[PRICES] Local server not available, connecting to Polygon directly...");
+                if let Err(e) = run_direct_polygon_feed(state.clone(), api_key).await {
+                    error!("[POLYGON] Connection error: {}", e);
                 }
-                Ok(Message::Ping(data)) => {
-                    let _ = write.send(Message::Pong(data)).await;
-                }
-                Err(e) => {
-                    error!("[POLYGON] WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
             }
         }
 
-        warn!("[POLYGON] Disconnected, reconnecting in 5s...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        warn!("[PRICES] Reconnecting in 3s...");
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
+}
+
+/// Connect to local price_feed server
+async fn run_local_price_feed(
+    state: Arc<RwLock<State>>,
+    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) -> Result<()> {
+    let (mut write, mut read) = ws.split();
+
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(update) = serde_json::from_str::<LocalPriceUpdate>(&text) {
+                    let mut s = state.write().await;
+                    if let Some(btc) = update.btc_price {
+                        s.prices.btc_price = Some(btc);
+                    }
+                    if let Some(eth) = update.eth_price {
+                        s.prices.eth_price = Some(eth);
+                    }
+                    s.prices.last_update = Some(std::time::Instant::now());
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                let _ = write.send(Message::Pong(data)).await;
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Connect directly to Polygon.io
+async fn run_direct_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) -> Result<()> {
+    let url = format!("{}?apiKey={}", POLYGON_WS_URL, api_key);
+    let (ws, _) = connect_async(&url).await?;
+    let (mut write, mut read) = ws.split();
+
+    // Subscribe to BTC and ETH
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "params": "XT.BTC-USD,XT.ETH-USD"
+    });
+    let _ = write.send(Message::Text(sub.to_string())).await;
+    info!("[POLYGON] Subscribed to BTC-USD, ETH-USD");
+
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(messages) = serde_json::from_str::<Vec<PolygonMessage>>(&text) {
+                    for m in messages {
+                        if m.ev.as_deref() != Some("XT") {
+                            continue;
+                        }
+
+                        let Some(pair) = m.pair.as_ref() else { continue };
+                        let Some(price) = m.p else { continue };
+
+                        let mut s = state.write().await;
+                        if pair == "BTC-USD" {
+                            s.prices.btc_price = Some(price);
+                        } else if pair == "ETH-USD" {
+                            s.prices.eth_price = Some(price);
+                        }
+                        s.prices.last_update = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                let _ = write.send(Message::Pong(data)).await;
+            }
+            Err(e) => {
+                error!("[POLYGON] WebSocket error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Calculate the distance from strike as a percentage
@@ -478,7 +536,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("poly_atm_sniper=info".parse().unwrap())
+                .add_directive("delta_50=info".parse().unwrap())
                 .add_directive("arb_bot=info".parse().unwrap()),
         )
         .init();
@@ -495,7 +553,7 @@ async fn main() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════════════════");
     info!("CONFIG:");
     info!("   Mode: {}", if args.live { "🚀 LIVE" } else { "🔍 DRY RUN" });
-    info!("   Size: ${:.2} per trade", args.size);
+    info!("   Contracts: {:.0} per side", args.contracts);
     info!("   Max bid: {}¢", args.bid);
     info!("   ATM threshold: {:.4}%", args.atm_threshold);
     info!("   Time window: {}m - {}m before expiry", args.min_minutes, args.max_minutes);
@@ -533,16 +591,11 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
-    // Discover markets
-    info!("[DISCOVER] Searching for crypto markets with strikes...");
-    let discovered = discover_markets(args.market.as_deref()).await?;
-    info!("[DISCOVER] Found {} markets", discovered.len());
-
-    for m in &discovered {
-        info!("  • {} | Strike: {:?} | Asset: {} | Expiry: {:?}min",
-              &m.question[..m.question.len().min(60)],
-              m.strike, m.asset, m.expiry_minutes);
-    }
+    // Discover markets (filter by symbol if specified)
+    let symbol_filter = args.symbol.as_deref().or(args.market.as_deref());
+    println!("[delta_50] [DISCOVER] Searching for {} markets...", symbol_filter.unwrap_or("BTC+ETH"));
+    let discovered = discover_markets(symbol_filter).await?;
+    println!("[delta_50] [DISCOVER] Found {} markets", discovered.len());
 
     if discovered.is_empty() {
         warn!("No markets found! Try different search terms.");
@@ -578,14 +631,16 @@ async fn main() -> Result<()> {
 
     // Main WebSocket loop
     let bid_price = args.bid;
-    let size = args.size;
+    let contracts = args.contracts;
     let atm_threshold = args.atm_threshold;
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
+    let quiet = args.quiet;
+    let symbol_filter = args.symbol.clone();
 
     loop {
-        info!("[WS] Connecting to Polymarket...");
+        if !quiet { println!("[delta_50] [WS] Connecting to Polymarket..."); }
 
         let (ws, _) = match connect_async(POLYMARKET_WS_URL).await {
             Ok(ws) => ws,
@@ -619,60 +674,76 @@ async fn main() -> Result<()> {
                 }
 
                 _ = status_interval.tick() => {
-                    let s = state.read().await;
-                    let spot_btc = s.prices.btc_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
-                    let spot_eth = s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
+                    if !quiet {
+                        let s = state.read().await;
 
-                    info!("[STATUS] BTC=${} ETH={}", spot_btc, spot_eth);
-
-                    for (id, market) in &s.markets {
-                        let pos = s.positions.get(id).cloned().unwrap_or_default();
-                        let orders = s.orders.get(id).cloned().unwrap_or_default();
-
-                        // Get spot for this market's asset
-                        let spot = if market.asset == "ETH" {
-                            s.prices.eth_price
-                        } else {
-                            s.prices.btc_price
-                        };
-
-                        let expiry = market.expiry_minutes.unwrap_or(0.0);
-                        if expiry < min_minutes || expiry > max_minutes {
-                            continue;
-                        }
-
-                        // Check ATM status
-                        let (atm_status, dist_pct) = match (spot, market.strike) {
-                            (Some(s), Some(k)) => {
-                                let dist = distance_from_strike_pct(s, k);
-                                let is_atm_now = dist <= atm_threshold;
-                                let status = if is_atm_now {
-                                    "✅ ATM"
-                                } else {
-                                    "⏳ OTM"
-                                };
-                                (status, format!("{:.4}%", dist))
+                        // Only show prices for filtered symbol(s)
+                        let status_msg = match symbol_filter.as_deref() {
+                            Some("BTC") | Some("btc") => {
+                                let spot = s.prices.btc_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
+                                format!("[delta_50] [STATUS] BTC=${}", spot)
                             }
-                            _ => ("❓ NO DATA", "-".into()),
+                            Some("ETH") | Some("eth") => {
+                                let spot = s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
+                                format!("[delta_50] [STATUS] ETH=${}", spot)
+                            }
+                            _ => {
+                                let btc = s.prices.btc_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
+                                let eth = s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into());
+                                format!("[delta_50] [STATUS] BTC=${} ETH={}", btc, eth)
+                            }
                         };
+                        println!("{}", status_msg);
 
-                        let yes_ask = market.yes_ask.unwrap_or(100);
-                        let no_ask = market.no_ask.unwrap_or(100);
+                        for (id, market) in &s.markets {
+                            let pos = s.positions.get(id).cloned().unwrap_or_default();
+                            let orders = s.orders.get(id).cloned().unwrap_or_default();
 
-                        let order_status = format!(
-                            "Y:{} N:{}",
-                            orders.yes_order_id.as_ref().map(|_| "📝").unwrap_or("-"),
-                            orders.no_order_id.as_ref().map(|_| "📝").unwrap_or("-")
-                        );
+                            // Get spot for this market's asset
+                            let spot = if market.asset == "ETH" {
+                                s.prices.eth_price
+                            } else {
+                                s.prices.btc_price
+                            };
 
-                        info!("  [{}] {} | {:.1}m | {} dist={} | Ask Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
-                              market.asset,
-                              &market.question[..market.question.len().min(40)],
-                              expiry,
-                              atm_status, dist_pct,
-                              yes_ask, no_ask,
-                              order_status,
-                              pos.yes_qty, pos.no_qty);
+                            let expiry = market.expiry_minutes.unwrap_or(0.0);
+                            if expiry < min_minutes || expiry > max_minutes {
+                                continue;
+                            }
+
+                            // Check ATM status
+                            let (atm_status, dist_pct) = match (spot, market.strike) {
+                                (Some(s), Some(k)) => {
+                                    let dist = distance_from_strike_pct(s, k);
+                                    let is_atm_now = dist <= atm_threshold;
+                                    let status = if is_atm_now {
+                                        "✅ ATM"
+                                    } else {
+                                        "⏳ OTM"
+                                    };
+                                    (status, format!("{:.4}%", dist))
+                                }
+                                _ => ("❓ NO DATA", "-".into()),
+                            };
+
+                            let yes_ask = market.yes_ask.unwrap_or(100);
+                            let no_ask = market.no_ask.unwrap_or(100);
+
+                            let order_status = format!(
+                                "Y:{} N:{}",
+                                orders.yes_order_id.as_ref().map(|_| "📝").unwrap_or("-"),
+                                orders.no_order_id.as_ref().map(|_| "📝").unwrap_or("-")
+                            );
+
+                            println!("[delta_50]   [{}] {} | {:.1}m | {} dist={} | Ask Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
+                                  market.asset,
+                                  &market.question[..market.question.len().min(40)],
+                                  expiry,
+                                  atm_status, dist_pct,
+                                  yes_ask, no_ask,
+                                  order_status,
+                                  pos.yes_qty, pos.no_qty);
+                        }
                     }
                 }
 
@@ -781,36 +852,35 @@ async fn main() -> Result<()> {
                                     let spot_str = format!("{:.2}", spot_price);
                                     let strike_str = format!("{:.0}", strike_price);
 
-                                    info!("════════════════════════════════════════════════════════════════");
-                                    info!("[ATM] 🎯 {} is AT-THE-MONEY! Spot=${} Strike=${} dist={:.4}%",
+                                    println!("════════════════════════════════════════════════════════════════");
+                                    println!("[delta_50] [ATM] 🎯 {} is AT-THE-MONEY! Spot=${} Strike=${} dist={:.4}%",
                                           asset, spot_str, strike_str, dist_pct);
-                                    info!("[ATM] Market: {}", &question[..question.len().min(60)]);
-                                    info!("[ATM] {:.1}m remaining | Ask Y={}¢ N={}¢",
+                                    println!("[delta_50] [ATM] Market: {}", &question[..question.len().min(60)]);
+                                    println!("[delta_50] [ATM] {:.1}m remaining | Ask Y={}¢ N={}¢",
                                           mins, yes_ask_price.unwrap_or(0), no_ask_price.unwrap_or(0));
-                                    info!("════════════════════════════════════════════════════════════════");
+                                    println!("════════════════════════════════════════════════════════════════");
 
                                     if dry_run {
                                         if need_yes && yes_worth_bidding {
-                                            info!("[DRY] Would BID ${:.0} YES @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            println!("[delta_50] [DRY] Would BID {:.0} YES @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
                                         }
                                         if need_no && no_worth_bidding {
-                                            info!("[DRY] Would BID ${:.0} NO @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            println!("[delta_50] [DRY] Would BID {:.0} NO @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
                                         }
                                     } else {
                                         // Place YES bid
                                         if need_yes && yes_worth_bidding {
                                             let price = bid_price as f64 / 100.0;
-                                            let contracts = size / price;
 
-                                            warn!("[TRADE] 📝 BID ${:.0} YES @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            println!("[delta_50] [TRADE] 📝 BID {:.0} YES @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
 
                                             match shared_client.buy_fak(&yes_token, price, contracts).await {
                                                 Ok(fill) => {
                                                     if fill.filled_size > 0.0 {
-                                                        warn!("[TRADE] ✅ YES Filled {:.2} @${:.2} | order_id={}",
+                                                        println!("[delta_50] [TRADE] ✅ YES Filled {:.2} @${:.2} | order_id={}",
                                                               fill.filled_size, fill.fill_cost, fill.order_id);
                                                         // Update position
                                                         let mut s = state.write().await;
@@ -819,25 +889,24 @@ async fn main() -> Result<()> {
                                                             pos.yes_cost += fill.fill_cost;
                                                         }
                                                     } else {
-                                                        info!("[TRADE] ⏳ YES order placed (no immediate fill)");
+                                                        println!("[delta_50] [TRADE] ⏳ YES order placed (no immediate fill)");
                                                     }
                                                 }
-                                                Err(e) => error!("[TRADE] ❌ YES bid failed: {}", e),
+                                                Err(e) => println!("[delta_50] [TRADE] ❌ YES bid failed: {}", e),
                                             }
                                         }
 
                                         // Place NO bid
                                         if need_no && no_worth_bidding {
                                             let price = bid_price as f64 / 100.0;
-                                            let contracts = size / price;
 
-                                            warn!("[TRADE] 📝 BID ${:.0} NO @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            println!("[delta_50] [TRADE] 📝 BID {:.0} NO @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
 
                                             match shared_client.buy_fak(&no_token, price, contracts).await {
                                                 Ok(fill) => {
                                                     if fill.filled_size > 0.0 {
-                                                        warn!("[TRADE] ✅ NO Filled {:.2} @${:.2} | order_id={}",
+                                                        println!("[delta_50] [TRADE] ✅ NO Filled {:.2} @${:.2} | order_id={}",
                                                               fill.filled_size, fill.fill_cost, fill.order_id);
                                                         // Update position
                                                         let mut s = state.write().await;
@@ -846,10 +915,10 @@ async fn main() -> Result<()> {
                                                             pos.no_cost += fill.fill_cost;
                                                         }
                                                     } else {
-                                                        info!("[TRADE] ⏳ NO order placed (no immediate fill)");
+                                                        println!("[delta_50] [TRADE] ⏳ NO order placed (no immediate fill)");
                                                     }
                                                 }
-                                                Err(e) => error!("[TRADE] ❌ NO bid failed: {}", e),
+                                                Err(e) => println!("[delta_50] [TRADE] ❌ NO bid failed: {}", e),
                                             }
                                         }
                                     }

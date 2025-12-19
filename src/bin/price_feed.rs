@@ -19,6 +19,8 @@ const LOCAL_WS_PORT: u16 = 9999;
 pub struct PriceUpdate {
     pub btc_price: Option<f64>,
     pub eth_price: Option<f64>,
+    pub sol_price: Option<f64>,
+    pub xrp_price: Option<f64>,
     pub timestamp: i64,
 }
 
@@ -51,10 +53,12 @@ struct StatusMessage {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("price_feed=info")
+        .with_target(true)
         .init();
 
     let api_key = std::env::var("POLYGON_KEY")
-        .expect("POLYGON_KEY environment variable required");
+        .or_else(|_| std::env::var("POLYGON_API_KEY"))
+        .unwrap_or_else(|_| "o2Jm26X52_0tRq2W7V5JbsCUXdMjL7qk".to_string());
 
     info!("════════════════════════════════════════════════════════════════════════");
     info!("📊 SHARED PRICE FEED SERVICE");
@@ -190,13 +194,13 @@ async fn run_polygon_feed(
         }
     }
 
-    // Subscribe to BTC-USD and ETH-USD trades
+    // Subscribe to BTC, ETH, SOL, XRP trades
     let subscribe = SubscribeMessage {
         action: "subscribe".to_string(),
-        params: "XT.BTC-USD,XT.ETH-USD".to_string(),
+        params: "XT.BTC-USD,XT.ETH-USD,XT.SOL-USD,XT.XRP-USD".to_string(),
     };
     write.send(Message::Text(serde_json::to_string(&subscribe)?)).await?;
-    info!("[POLYGON] Subscribed to BTC-USD and ETH-USD trades");
+    info!("[POLYGON] Subscribed to BTC, ETH, SOL, XRP trades");
 
     // Keepalive ping
     let write = Arc::new(tokio::sync::Mutex::new(write));
@@ -236,6 +240,20 @@ async fn run_polygon_feed(
                                         if state.eth_price != Some(price) {
                                             info!("[ETH] ${:.2}", price);
                                             state.eth_price = Some(price);
+                                            updated = true;
+                                        }
+                                    }
+                                    "SOL-USD" => {
+                                        if state.sol_price != Some(price) {
+                                            info!("[SOL] ${:.4}", price);
+                                            state.sol_price = Some(price);
+                                            updated = true;
+                                        }
+                                    }
+                                    "XRP-USD" => {
+                                        if state.xrp_price != Some(price) {
+                                            info!("[XRP] ${:.4}", price);
+                                            state.xrp_price = Some(price);
                                             updated = true;
                                         }
                                     }

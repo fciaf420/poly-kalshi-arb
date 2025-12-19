@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod execution;
 pub mod fair_value;
 pub mod kalshi;
+pub mod paper_trading;
 pub mod polymarket;
 pub mod polymarket_clob;
 pub mod position_tracker;

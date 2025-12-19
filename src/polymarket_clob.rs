@@ -410,7 +410,8 @@ pub struct PolymarketAsyncClient {
 impl PolymarketAsyncClient {
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
-        let wallet_address_str = format!("{:?}", wallet.address());
+        // Use Display format for checksummed (EIP-55) address - required for EIP712
+        let wallet_address_str = format!("{}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
@@ -423,12 +424,17 @@ impl PolymarketAsyncClient {
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
 
+        // Parse funder as Address to get checksummed format for EIP712 signing
+        let funder_addr: ethers::types::Address = funder.parse()
+            .map_err(|e| anyhow!("Invalid funder address: {}", e))?;
+        let funder_checksummed = format!("{}", funder_addr);
+
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
             chain_id,
             http,
             wallet: Arc::new(wallet),
-            funder: funder.to_string(),
+            funder: funder_checksummed,
             wallet_address_str,
             address_header,
         })
