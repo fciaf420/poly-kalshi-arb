@@ -445,8 +445,11 @@ impl PolymarketAsyncClient {
     /// wallet.sign_hash() is CPU-bound (~1ms), safe to call in async context
     fn build_l1_headers(&self, nonce: u64) -> Result<HeaderMap> {
         let timestamp = current_unix_ts();
+        info!("[poly_momentum] Wallet: {}", self.wallet_address_str);
         let digest = clob_auth_digest(self.chain_id, &self.wallet_address_str, timestamp, nonce)?;
+        info!("[poly_momentum] Digest: {}", digest);
         let sig = self.wallet.sign_hash(digest)?;
+        info!("[poly_momentum] Sig: {}", sig);
         let mut headers = HeaderMap::new();
         headers.insert("POLY_ADDRESS", self.address_header.clone());
         headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&format!("0x{}", sig))?);
