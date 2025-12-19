@@ -128,7 +128,9 @@ fn clob_auth_digest(chain_id: u64, address_str: &str, timestamp: u64, nonce: u64
         "domain": { "name": "ClobAuthDomain", "version": "1", "chainId": chain_id },
         "message": { "address": address_str, "timestamp": timestamp.to_string(), "nonce": nonce, "message": MSG_TO_SIGN }
     });
+    info!("[poly_clob_auth_digest] {}", typed_json);
     let typed: TypedData = serde_json::from_value(typed_json)?;
+    info!("[poly_clob_auth_digest] {}", typed);
     Ok(typed.encode_eip712()?.into())
 }
 
@@ -445,9 +447,9 @@ impl PolymarketAsyncClient {
     /// wallet.sign_hash() is CPU-bound (~1ms), safe to call in async context
     fn build_l1_headers(&self, nonce: u64) -> Result<HeaderMap> {
         let timestamp = current_unix_ts();
-        info!("[poly_momentum] Wallet: {}", self.wallet_address_str);
+        info!("[poly_momentum] Wallet: {} clob_auth_digest next", self.wallet_address_str);
         let digest = clob_auth_digest(self.chain_id, &self.wallet_address_str, timestamp, nonce)?;
-        info!("[poly_momentum] Digest: {}", digest);
+        info!("[poly_momentum] Digest: {} clob_auth_digest", digest);
         let sig = self.wallet.sign_hash(digest)?;
         info!("[poly_momentum] Sig: {}", sig);
         let mut headers = HeaderMap::new();
