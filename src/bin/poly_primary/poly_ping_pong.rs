@@ -503,6 +503,7 @@ fn parse_end_time(end_date: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 #[derive(Deserialize, Debug)]
 struct BookSnapshot {
+    #[serde(alias = "market")]
     asset_id: String,
     bids: Vec<PriceLevel>,
     asks: Vec<PriceLevel>,
@@ -512,6 +513,26 @@ struct BookSnapshot {
 struct PriceLevel {
     price: String,
     size: String,
+}
+
+/// Wrapped message format that Polymarket might use
+#[derive(Deserialize, Debug)]
+struct WrappedBookMessage {
+    #[serde(default)]
+    data: Vec<BookSnapshot>,
+}
+
+/// Price change message format from Polymarket WebSocket
+#[derive(Deserialize, Debug)]
+struct PriceChangeMessage {
+    #[serde(default)]
+    price_changes: Vec<PriceChange>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PriceChange {
+    asset_id: String,
+    price: String,
 }
 
 #[derive(Serialize)]
@@ -850,11 +871,59 @@ async fn main() -> Result<()> {
 
                     match msg {
                         Ok(Message::Text(text)) => {
-                            trace!("[WS] Raw message: {}", &text[..text.len().min(300)]);
+                            debug!("[WS] Raw message: {}", &text[..text.len().min(300)]);
 
-                            match serde_json::from_str::<Vec<BookSnapshot>>(&text) {
-                                Ok(books) => {
-                                    debug!("[WS] Parsed {} book snapshots", books.len());
+                            // Try parsing in multiple formats:
+                            // 1. Array of BookSnapshot (initial snapshots)
+                            // 2. Single BookSnapshot (individual updates)
+                            // 3. Wrapped message with data field
+                            // 4. PriceChangeMessage (real-time price updates)
+                            let books: Vec<BookSnapshot> = serde_json::from_str::<Vec<BookSnapshot>>(&text)
+                                .or_else(|_| serde_json::from_str::<BookSnapshot>(&text).map(|s| vec![s]))
+                                .or_else(|_| serde_json::from_str::<WrappedBookMessage>(&text).map(|w| w.data))
+                                .unwrap_or_default();
+
+                            // Handle price change messages (real-time updates)
+                            if let Ok(price_msg) = serde_json::from_str::<PriceChangeMessage>(&text) {
+                                if !price_msg.price_changes.is_empty() {
+                                    let mut s = state.write().await;
+                                    for pc in price_msg.price_changes {
+                                        // Find market for this asset
+                                        let market_entry = s.markets.iter_mut()
+                                            .find(|(_, m)| m.yes_token == pc.asset_id || m.no_token == pc.asset_id);
+
+                                        if let Some((_, market)) = market_entry {
+                                            let is_yes = pc.asset_id == market.yes_token;
+                                            let price_cents = pc.price.parse::<f64>()
+                                                .map(|p| (p * 100.0).round() as i64)
+                                                .unwrap_or(0);
+
+                                            // Set bid/ask based on the price update (assume 1c spread)
+                                            let (old_ask, old_bid) = if is_yes {
+                                                let old = (market.yes_ask, market.yes_bid);
+                                                market.yes_bid = Some(price_cents.saturating_sub(1).max(1));
+                                                market.yes_ask = Some((price_cents + 1).min(99));
+                                                old
+                                            } else {
+                                                let old = (market.no_ask, market.no_bid);
+                                                market.no_bid = Some(price_cents.saturating_sub(1).max(1));
+                                                market.no_ask = Some((price_cents + 1).min(99));
+                                                old
+                                            };
+
+                                            let side = if is_yes { "YES" } else { "NO" };
+                                            if old_ask != Some((price_cents + 1).min(99)) || old_bid != Some(price_cents.saturating_sub(1).max(1)) {
+                                                debug!("[PRICE] {} {} | price={:.2} -> bid={}c ask={}c",
+                                                       market.asset, side, pc.price.parse::<f64>().unwrap_or(0.0),
+                                                       price_cents.saturating_sub(1).max(1), (price_cents + 1).min(99));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !books.is_empty() {
+                                debug!("[WS] Parsed {} book snapshots", books.len());
 
                                     for book in books {
                                         let mut s = state.write().await;
@@ -944,11 +1013,14 @@ async fn main() -> Result<()> {
                                         let bid_changed = old_bid != new_bid;
                                         let size_changed = (old_size - total_ask_size).abs() > 0.01;
 
-                                        if ask_changed || bid_changed || size_changed {
-                                            debug!("[BOOK] {} {} | bid: {:?}c->{:?}c | ask: {:?}c->{:?}c | liq: {:.0}->{:.0} (bids={} asks={})",
+                                        if ask_changed || bid_changed {
+                                            info!("[BOOK] {} {} | bid: {:?}c->{:?}c | ask: {:?}c->{:?}c",
                                                    market.asset, side,
                                                    old_bid, new_bid,
-                                                   old_ask, new_ask,
+                                                   old_ask, new_ask);
+                                        } else if size_changed {
+                                            debug!("[BOOK] {} {} | liq: {:.0}->{:.0} (bids={} asks={})",
+                                                   market.asset, side,
                                                    old_size, total_ask_size,
                                                    book.bids.len(), book.asks.len());
                                         } else {
@@ -1226,14 +1298,12 @@ async fn main() -> Result<()> {
                                                    asset, yes_ask, no_ask, combined, max_arb_cost);
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    // Check if it's a different message type
-                                    if text.contains("\"type\"") {
-                                        debug!("[WS] Non-book message: {}", &text[..text.len().min(100)]);
-                                    } else {
-                                        trace!("[WS] Parse error: {} - msg: {}", e, &text[..text.len().min(100)]);
-                                    }
+                            } else if !text.is_empty() {
+                                // Failed to parse as book snapshot - log what we received
+                                if text.contains("\"type\"") {
+                                    debug!("[WS] Non-book message: {}", &text[..text.len().min(100)]);
+                                } else {
+                                    info!("[WS] Unknown message format: {}", &text[..text.len().min(200)]);
                                 }
                             }
                         }

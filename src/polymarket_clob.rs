@@ -192,17 +192,6 @@ pub struct SignedOrder {
 impl SignedOrder {
     /// Generate POST body for order submission
     pub fn post_body(&self, owner: &str, order_type: &str) -> String {
-        // Compute the price from amounts for the API
-        // For SELL (side=1), price = taker/maker to get value < 1
-        // For BUY (side=0), price = maker/taker
-        let maker_amt: f64 = self.order.maker_amount.parse().unwrap_or(0.0);
-        let taker_amt: f64 = self.order.taker_amount.parse().unwrap_or(1.0);
-        let api_price = if self.order.side == 1 {
-            taker_amt / maker_amt
-        } else {
-            maker_amt / taker_amt
-        };
-
         let mut buf = String::with_capacity(512);
         buf.push_str(r#"{"order":{"salt":"#);
         buf.push_str(&self.order.salt.to_string());
@@ -234,9 +223,7 @@ impl SignedOrder {
         buf.push_str(owner);
         buf.push_str(r#"","orderType":""#);
         buf.push_str(order_type);
-        buf.push_str(r#"","price":""#);
-        buf.push_str(&format!("{:.2}", api_price));
-        buf.push_str(r#"","tickSize":"0.01"}"#);
+        buf.push_str(r#""}"#);
         buf
     }
 }
@@ -278,9 +265,16 @@ pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u12
 /// SELL order calculation
 /// Input: size in micro-units, price in basis points
 /// Output: (side=1, maker_amount, taker_amount) in token decimals (6 dp)
+///
+/// NOTE: Polymarket SELL orders are currently broken in the API.
+/// The API calculates price as maker/taker (giving >1 for sells),
+/// but signature validation expects maker=tokens, taker=USDC.
+/// This creates an impossible situation - we can't satisfy both constraints.
+/// For now, SELL orders are disabled and positions should be held to expiry.
 #[inline(always)]
 pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // For SELL: maker = tokens (what we give), taker = USDC (what we receive)
+    // Semantically correct for contract signature:
+    // maker = tokens (what we give), taker = USDC (what we receive)
     let maker = size_micro as u128;
     let taker = (size_micro as u128 * price_bps as u128) / 10000;
     (1, maker, taker)
@@ -618,7 +612,7 @@ impl SharedAsyncClient {
             return Err(anyhow!("price must be 0 < p < 1, got {}", price));
         }
         info!("[POLY] SELL {:.1} @ {:.2}", size, price);
-        self.execute_order_with_type(token_id, price, size, "SELL", PolyOrderType::GTC).await
+        self.execute_order(token_id, price, size, "SELL").await
     }
 
     async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
@@ -632,7 +626,7 @@ impl SharedAsyncClient {
             cache.get(token_id).copied()
         };
 
-        let mut neg_risk = match neg_risk {
+        let neg_risk = match neg_risk {
             Some(nr) => nr,
             None => {
                 let nr = self.inner.check_neg_risk(token_id).await?;

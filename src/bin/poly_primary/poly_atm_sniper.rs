@@ -736,14 +736,18 @@ async fn main() -> Result<()> {
                         }
 
                         // Check ATM status using captured strike price
+                        // For Up/Down markets: YES wins if spot >= strike at expiry
+                        // ITM = spot > strike (YES favored), OTM = spot < strike (NO favored)
                         let (atm_status, dist_pct) = match (spot, market.strike_price) {
                             (Some(s), Some(k)) => {
                                 let dist = distance_from_strike_pct(s, k);
                                 let is_atm_now = dist <= atm_threshold;
                                 let status = if is_atm_now {
                                     "✅ ATM"
+                                } else if s > k {
+                                    "📈 ITM" // spot > strike, YES (Up) is in-the-money
                                 } else {
-                                    "⏳ OTM"
+                                    "📉 OTM" // spot < strike, YES (Up) is out-of-the-money
                                 };
                                 (status, format!("{:.4}%", dist))
                             }
