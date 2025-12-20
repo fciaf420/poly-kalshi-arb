@@ -919,6 +919,7 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 // Sell 1¢ below bid to ensure fill
                                 let sell_price = (bid - 1).max(1) as f64 / 100.0;
+                                info!("sell price: {}", sell_price);
                                 match client.sell_fak(&token_clone, sell_price, size).await {
                                     Ok(fill) if fill.filled_size > 0.0 => {
                                         warn!("[poly_momentum] ✅ Sold {:.1} @${:.2}", fill.filled_size, fill.fill_cost);
