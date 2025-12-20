@@ -18,7 +18,6 @@
 //!   POLYGON_API_KEY - Polygon.io API key for price feed
 
 use anyhow::{Context, Result};
-use chrono::{TimeZone, Utc};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -218,6 +217,19 @@ struct PriceLevel {
     size: String,
 }
 
+/// Price change message format from Polymarket WebSocket
+#[derive(Deserialize, Debug)]
+struct PriceChangeMessage {
+    #[serde(default)]
+    price_changes: Vec<PriceChange>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PriceChange {
+    asset_id: String,
+    price: String,
+}
+
 #[derive(Serialize)]
 struct SubscribeCmd {
     assets_ids: Vec<String>,
@@ -321,8 +333,15 @@ async fn run_local_price_feed(
                             if market.asset == asset && market.strike_price.is_none() {
                                 if let Some(start_ts) = market.window_start_ts {
                                     if now_ts >= start_ts {
+                                        let delay_secs = now_ts - start_ts;
                                         market.strike_price = Some(price);
-                                        info!("[STRIKE] {} captured: ${:.2}", asset, price);
+                                        if delay_secs > 10 {
+                                            warn!("[STRIKE] ⚠️ {} captured: ${:.2} ({}s LATE - may not match Chainlink!)",
+                                                  asset, price, delay_secs);
+                                        } else {
+                                            info!("[STRIKE] {} captured: ${:.2} ({}s after window start)",
+                                                  asset, price, delay_secs);
+                                        }
                                     }
                                 }
                             }
@@ -398,8 +417,15 @@ async fn run_direct_polygon_feed(state: Arc<RwLock<State>>, api_key: &str) -> Re
                             if market.asset == asset && market.strike_price.is_none() {
                                 if let Some(start_ts) = market.window_start_ts {
                                     if now_ts >= start_ts {
+                                        let delay_secs = now_ts - start_ts;
                                         market.strike_price = Some(price);
-                                        info!("[STRIKE] {} captured: ${:.2}", asset, price);
+                                        if delay_secs > 10 {
+                                            warn!("[STRIKE] ⚠️ {} captured: ${:.2} ({}s LATE - may not match Chainlink!)",
+                                                  asset, price, delay_secs);
+                                        } else {
+                                            info!("[STRIKE] {} captured: ${:.2} ({}s after window start)",
+                                                  asset, price, delay_secs);
+                                        }
                                     }
                                 }
                             }
@@ -665,7 +691,7 @@ async fn main() -> Result<()> {
         info!("[WS] Subscribed to {} tokens ({} markets)", tokens.len(), tokens.len() / 2);
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
-        let mut status_interval = tokio::time::interval(Duration::from_secs(5));
+        let mut status_interval = tokio::time::interval(Duration::from_secs(1)); // Fast 1s checks for ATM
         let mut resub_check_interval = tokio::time::interval(Duration::from_secs(2));
 
         loop {
@@ -707,15 +733,31 @@ async fn main() -> Result<()> {
                             s.prices.eth_price.map(|p| format!("{:.2}", p)).unwrap_or("-".into()))
                     };
 
-                    // Calculate total position
+                    // Calculate total position and unrealized P&L
                     let total_yes: f64 = s.positions.values().map(|p| p.yes_qty).sum();
                     let total_no: f64 = s.positions.values().map(|p| p.no_qty).sum();
                     let total_cost: f64 = s.positions.values().map(|p| p.yes_cost + p.no_cost).sum();
                     let matched = total_yes.min(total_no);
-                    let locked_profit = matched - total_cost; // $1 payout per matched pair minus cost
 
-                    info!("[STATUS] {} | Pos: Y={:.1} N={:.1} matched={:.1} | Cost=${:.2} Profit=${:.2} | {:.0}/{:.0}",
-                          price_str, total_yes, total_no, matched, total_cost, locked_profit, total_yes + total_no, max_contracts);
+                    // Calculate mark-to-market value using current bid prices
+                    let mut mtm_value = matched; // Matched pairs are worth $1 guaranteed
+                    for (market_id, pos) in &s.positions {
+                        if let Some(market) = s.markets.get(market_id) {
+                            // Unmatched positions valued at current bid (what we could sell for)
+                            let unmatched_yes = (pos.yes_qty - matched.min(pos.yes_qty)).max(0.0);
+                            let unmatched_no = (pos.no_qty - matched.min(pos.no_qty)).max(0.0);
+
+                            let yes_bid_price = market.yes_bid.unwrap_or(50) as f64 / 100.0;
+                            let no_bid_price = market.no_bid.unwrap_or(50) as f64 / 100.0;
+
+                            mtm_value += unmatched_yes * yes_bid_price;
+                            mtm_value += unmatched_no * no_bid_price;
+                        }
+                    }
+                    let unrealized_pnl = mtm_value - total_cost;
+
+                    info!("[poly_atm_sniper] {} | Pos: Y={:.1} N={:.1} matched={:.1} | Cost=${:.2} MTM=${:.2} PnL=${:+.2} | {:.0}/{:.0}",
+                          price_str, total_yes, total_no, matched, total_cost, mtm_value, unrealized_pnl, total_yes + total_no, max_contracts);
 
                     for (id, market) in &s.markets {
                         let pos = s.positions.get(id).cloned().unwrap_or_default();
@@ -738,7 +780,7 @@ async fn main() -> Result<()> {
                         // Check ATM status using captured strike price
                         // For Up/Down markets: YES wins if spot >= strike at expiry
                         // ITM = spot > strike (YES favored), OTM = spot < strike (NO favored)
-                        let (atm_status, dist_pct) = match (spot, market.strike_price) {
+                        let (atm_status, dist_pct, is_atm) = match (spot, market.strike_price) {
                             (Some(s), Some(k)) => {
                                 let dist = distance_from_strike_pct(s, k);
                                 let is_atm_now = dist <= atm_threshold;
@@ -749,10 +791,10 @@ async fn main() -> Result<()> {
                                 } else {
                                     "📉 OTM" // spot < strike, YES (Up) is out-of-the-money
                                 };
-                                (status, format!("{:.4}%", dist))
+                                (status, format!("{:.4}%", dist), is_atm_now)
                             }
-                            (_, None) => ("⏳ WAIT", "-".into()), // Waiting for strike to be captured
-                            _ => ("❓ NO PRICE", "-".into()),
+                            (_, None) => ("⏳ WAIT", "-".into(), false), // Waiting for strike to be captured
+                            _ => ("❓ NO PRICE", "-".into(), false),
                         };
 
                         let yes_ask = market.yes_ask.unwrap_or(100);
@@ -768,27 +810,94 @@ async fn main() -> Result<()> {
                             .map(|s| format!("${:.0}", s))
                             .unwrap_or_else(|| "?".into());
 
-                        // Calculate end time (window_start + 15 minutes)
-                        let end_time_str = market.window_start_ts
-                            .map(|start_ts| {
-                                let end_ts = start_ts + 15 * 60; // 15 minutes after start
-                                Utc.timestamp_opt(end_ts, 0)
-                                    .single()
-                                    .map(|dt| dt.format("%H:%M:%S").to_string())
-                                    .unwrap_or_else(|| "?".into())
-                            })
-                            .unwrap_or_else(|| "?".into());
-
-                        info!("  [{}] {} | {:.1}m ends@{} | strike={} | {} dist={} | Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
+                        // Clean up market question (remove "Up or Down" text)
+                        let clean_question = market.question
+                            .replace("Up or Down", "")
+                            .replace("  ", " ");
+                        info!("  [{}] {} | {:.1}m left | strike={} | {} dist={} | Y={}¢ N={}¢ | {} | Pos: Y={:.1} N={:.1}",
                               market.asset,
-                              &market.question[..market.question.len().min(35)],
+                              &clean_question[..clean_question.len().min(35)],
                               expiry,
-                              end_time_str,
                               strike_str,
                               atm_status, dist_pct,
                               yes_ask, no_ask,
                               order_status,
                               pos.yes_qty, pos.no_qty);
+
+                        // If ATM, show clear signal
+                        if is_atm {
+                            let yes_worth = yes_ask > bid_price;
+                            let no_worth = no_ask > bid_price;
+                            warn!("  ⚡ ATM DETECTED: {} dist={} | bid@{}¢ vs ask Y={}¢{} N={}¢{}",
+                                  market.asset, dist_pct, bid_price,
+                                  yes_ask, if yes_worth { "✓" } else { "✗" },
+                                  no_ask, if no_worth { "✓" } else { "✗" });
+                        }
+                    }
+
+                    // Proactive trading: attempt trades during status tick, not just on orderbook updates
+                    let total_pos: f64 = s.positions.values().map(|p| p.yes_qty + p.no_qty).sum();
+                    if total_pos < max_contracts {
+                        let atm_ops: Vec<(String, String, String, i64, i64, String)> = s.markets.iter()
+                            .filter_map(|(id, m)| {
+                                let exp = m.time_remaining_mins().unwrap_or(0.0);
+                                if exp < min_minutes || exp > max_minutes { return None; }
+                                let spot = match m.asset.as_str() {
+                                    "BTC" => s.prices.btc_price, "ETH" => s.prices.eth_price,
+                                    "SOL" => s.prices.sol_price, "XRP" => s.prices.xrp_price, _ => None,
+                                }?;
+                                let dist = distance_from_strike_pct(spot, m.strike_price?);
+                                if dist > atm_threshold { return None; }
+                                let (ya, na) = (m.yes_ask.unwrap_or(100), m.no_ask.unwrap_or(100));
+                                let ord = s.orders.get(id).cloned().unwrap_or_default();
+                                if (ord.yes_order_id.is_none() && ya > bid_price) || (ord.no_order_id.is_none() && na > bid_price) {
+                                    Some((id.clone(), m.yes_token.clone(), m.no_token.clone(), ya, na, m.asset.clone()))
+                                } else { None }
+                            }).collect();
+                        drop(s);
+
+                        for (mid, ytok, ntok, yask, nask, asset) in atm_ops {
+                            let ord = state.read().await.orders.get(&mid).cloned().unwrap_or_default();
+                            let (need_y, need_n) = (ord.yes_order_id.is_none() && yask > bid_price, ord.no_order_id.is_none() && nask > bid_price);
+                            if dry_run {
+                                if need_y { warn!("🔔🔔🔔 [TICK] Would BID {} YES @{}¢ | ask={}¢ | {} 🔔🔔🔔", contracts, bid_price, yask, asset); }
+                                if need_n { warn!("🔔🔔🔔 [TICK] Would BID {} NO @{}¢ | ask={}¢ | {} 🔔🔔🔔", contracts, bid_price, nask, asset); }
+                            } else {
+                                let pr = bid_price as f64 / 100.0;
+                                let min_c = (1.0 / pr).ceil();
+                                let remaining = max_contracts - total_pos;
+
+                                // Skip if not enough capacity for minimum order
+                                if remaining < min_c {
+                                    debug!("[TICK] {} need {:.0} contracts for $1 min, only {:.0} capacity", asset, min_c, remaining);
+                                    continue;
+                                }
+
+                                let act_c = min_c.min(remaining);
+                                if need_y {
+                                    warn!("🔔🔔🔔 [TICK] 📝 BID {:.0} YES @{}¢ (${:.2}) | ask={}¢ | {} 🔔🔔🔔", act_c, bid_price, act_c * pr, yask, asset);
+                                    if let Ok(f) = shared_client.buy_fak(&ytok, pr, act_c).await {
+                                        if f.filled_size > 0.0 {
+                                            let fp = (f.fill_cost / f.filled_size * 100.0).round() as i64;
+                                            warn!("🔔 [TICK] ✅ YES Filled {:.2} @{}¢ (${:.2})", f.filled_size, fp, f.fill_cost);
+                                            let mut st = state.write().await;
+                                            if let Some(p) = st.positions.get_mut(&mid) { p.yes_qty += f.filled_size; p.yes_cost += f.fill_cost; }
+                                        }
+                                    }
+                                }
+                                if need_n {
+                                    warn!("🔔🔔🔔 [TICK] 📝 BID {:.0} NO @{}¢ (${:.2}) | ask={}¢ | {} 🔔🔔🔔", act_c, bid_price, act_c * pr, nask, asset);
+                                    if let Ok(f) = shared_client.buy_fak(&ntok, pr, act_c).await {
+                                        if f.filled_size > 0.0 {
+                                            let fp = (f.fill_cost / f.filled_size * 100.0).round() as i64;
+                                            warn!("🔔 [TICK] ✅ NO Filled {:.2} @{}¢ (${:.2})", f.filled_size, fp, f.fill_cost);
+                                            let mut st = state.write().await;
+                                            if let Some(p) = st.positions.get_mut(&mid) { p.no_qty += f.filled_size; p.no_cost += f.fill_cost; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -903,6 +1012,20 @@ async fn main() -> Result<()> {
                                         continue;
                                     }
 
+                                    // Calculate remaining capacity
+                                    let remaining = max_contracts - total_position;
+
+                                    // Calculate minimum contracts needed for $1 order
+                                    let price = bid_price as f64 / 100.0;
+                                    let min_contracts = (1.0 / price).ceil();
+
+                                    // Skip if we don't have enough capacity for minimum order
+                                    if remaining < min_contracts {
+                                        debug!("[SKIP] {} need {:.0} contracts for $1 min, only {:.0} capacity",
+                                               asset, min_contracts, remaining);
+                                        continue;
+                                    }
+
                                     // Determine if we need to place orders
                                     let need_yes = orders.yes_order_id.is_none();
                                     let need_no = orders.no_order_id.is_none();
@@ -911,9 +1034,11 @@ async fn main() -> Result<()> {
                                         continue;
                                     }
 
-                                    // Only bid if ask is above our bid (otherwise no edge)
-                                    let yes_worth_bidding = yes_ask_price.map(|a| a > bid_price).unwrap_or(true);
-                                    let no_worth_bidding = no_ask_price.map(|a| a > bid_price).unwrap_or(true);
+                                    // Check combined cost - only worth it if YES + NO asks <= 100¢
+                                    // But we use FAK at our bid price, so we'll fill at ask or not at all
+                                    let yes_ask = yes_ask_price.unwrap_or(100);
+                                    let no_ask = no_ask_price.unwrap_or(100);
+                                    let combined = yes_ask + no_ask;
 
                                     let spot_str = format!("{:.2}", spot_price);
                                     let strike_str = format!("{:.0}", strike_price);
@@ -922,38 +1047,32 @@ async fn main() -> Result<()> {
                                     info!("[ATM] 🎯 {} is AT-THE-MONEY! Spot=${} Strike=${} dist={:.4}%",
                                           asset, spot_str, strike_str, dist_pct);
                                     info!("[ATM] Market: {}", &question[..question.len().min(60)]);
-                                    info!("[ATM] {:.1}m remaining | Ask Y={}¢ N={}¢",
-                                          mins, yes_ask_price.unwrap_or(0), no_ask_price.unwrap_or(0));
+                                    info!("[ATM] {:.1}m remaining | Ask Y={}¢ N={}¢ | Combined={}¢ {}",
+                                          mins, yes_ask, no_ask, combined,
+                                          if combined < 100 { "✅ PROFITABLE" } else { "⚠️ no arb" });
                                     info!("════════════════════════════════════════════════════════════════");
 
                                     if dry_run {
-                                        if need_yes && yes_worth_bidding {
-                                            info!("[DRY] Would BID {} contracts YES @{}¢ | delta≈0.50 | {}",
-                                                  contracts, bid_price, asset);
+                                        // In dry run, show what we'd do - buy both sides if ATM
+                                        if need_yes {
+                                            warn!("🔔🔔🔔 [ORDER] Would BUY YES @{}¢ (ask={}¢) | {} 🔔🔔🔔",
+                                                  bid_price.min(yes_ask as i64), yes_ask, asset);
                                         }
-                                        if need_no && no_worth_bidding {
-                                            info!("[DRY] Would BID {} contracts NO @{}¢ | delta≈0.50 | {}",
-                                                  contracts, bid_price, asset);
+                                        if need_no {
+                                            warn!("🔔🔔🔔 [ORDER] Would BUY NO @{}¢ (ask={}¢) | {} 🔔🔔🔔",
+                                                  bid_price.min(no_ask as i64), no_ask, asset);
                                         }
                                     } else {
-                                        // Place YES bid
-                                        if need_yes && yes_worth_bidding {
-                                            let price = bid_price as f64 / 100.0;
+                                        // Place YES order - use lower of bid or ask as our limit
+                                        if need_yes {
                                             let current_ask = yes_ask_price.unwrap_or(0);
 
-                                            // Polymarket requires minimum $1 order value - scale up contracts if needed
-                                            let min_contracts = (1.0 / price).ceil();
-                                            let actual_contracts = contracts.max(min_contracts);
+                                            // Use minimum contracts needed for $1 order, capped by remaining
+                                            let actual_contracts = min_contracts.min(remaining);
                                             let cost = actual_contracts * price;
 
-                                            // Skip if still below $1 minimum
-                                            if cost < 1.0 {
-                                                debug!("[SKIP] YES order ${:.2} below $1 minimum", cost);
-                                                continue;
-                                            }
-
-                                            warn!("[TRADE] 📝 BID {} contracts YES @{}¢ | ask={}¢ | delta≈0.50 | {}",
-                                                  actual_contracts, bid_price, current_ask, asset);
+                                            warn!("[TRADE] 📝 BID {:.0} contracts YES @{}¢ (${:.2}) | ask={}¢ | delta≈0.50 | {}",
+                                                  actual_contracts, bid_price, cost, current_ask, asset);
 
                                             match shared_client.buy_fak(&yes_token, price, actual_contracts).await {
                                                 Ok(fill) => {
@@ -977,22 +1096,14 @@ async fn main() -> Result<()> {
 
                                         // Place NO bid
                                         if need_no && no_worth_bidding {
-                                            let price = bid_price as f64 / 100.0;
                                             let current_ask = no_ask_price.unwrap_or(0);
 
-                                            // Polymarket requires minimum $1 order value - scale up contracts if needed
-                                            let min_contracts = (1.0 / price).ceil();
-                                            let actual_contracts = contracts.max(min_contracts);
+                                            // Use minimum contracts needed for $1 order, capped by remaining
+                                            let actual_contracts = min_contracts.min(remaining);
                                             let cost = actual_contracts * price;
 
-                                            // Skip if still below $1 minimum
-                                            if cost < 1.0 {
-                                                debug!("[SKIP] NO order ${:.2} below $1 minimum", cost);
-                                                continue;
-                                            }
-
-                                            warn!("[TRADE] 📝 BID {} contracts NO @{}¢ | ask={}¢ | delta≈0.50 | {}",
-                                                  actual_contracts, bid_price, current_ask, asset);
+                                            warn!("[TRADE] 📝 BID {:.0} contracts NO @{}¢ (${:.2}) | ask={}¢ | delta≈0.50 | {}",
+                                                  actual_contracts, bid_price, cost, current_ask, asset);
 
                                             match shared_client.buy_fak(&no_token, price, actual_contracts).await {
                                                 Ok(fill) => {
@@ -1011,6 +1122,108 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                                 Err(e) => error!("[TRADE] ❌ NO bid failed: {}", e),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Handle price change messages (real-time updates) - ALSO triggers trades!
+                            else if let Ok(price_msg) = serde_json::from_str::<PriceChangeMessage>(&text) {
+                                if !price_msg.price_changes.is_empty() {
+                                    // Collect ATM opportunities after updating prices
+                                    let mut atm_trades: Vec<(String, String, String, i64, i64, String)> = Vec::new();
+
+                                    {
+                                        let mut s = state.write().await;
+                                        let total_pos: f64 = s.positions.values().map(|p| p.yes_qty + p.no_qty).sum();
+
+                                        for pc in &price_msg.price_changes {
+                                            // Find and update market
+                                            let market_info = s.markets.iter_mut()
+                                                .find(|(_, m)| m.yes_token == pc.asset_id || m.no_token == pc.asset_id)
+                                                .map(|(id, m)| {
+                                                    let is_yes = pc.asset_id == m.yes_token;
+                                                    let price_cents = pc.price.parse::<f64>()
+                                                        .map(|p| (p * 100.0).round() as i64)
+                                                        .unwrap_or(0);
+
+                                                    // Update bid/ask
+                                                    if is_yes {
+                                                        m.yes_bid = Some(price_cents.saturating_sub(1).max(1));
+                                                        m.yes_ask = Some((price_cents + 1).min(99));
+                                                    } else {
+                                                        m.no_bid = Some(price_cents.saturating_sub(1).max(1));
+                                                        m.no_ask = Some((price_cents + 1).min(99));
+                                                    }
+
+                                                    (id.clone(), m.clone())
+                                                });
+
+                                            if let Some((mid, market)) = market_info {
+                                                // Check ATM condition
+                                                let exp = market.time_remaining_mins().unwrap_or(0.0);
+                                                if exp < min_minutes || exp > max_minutes { continue; }
+
+                                                let spot = match market.asset.as_str() {
+                                                    "BTC" => s.prices.btc_price,
+                                                    "ETH" => s.prices.eth_price,
+                                                    "SOL" => s.prices.sol_price,
+                                                    "XRP" => s.prices.xrp_price,
+                                                    _ => None,
+                                                };
+                                                let Some(spot_val) = spot else { continue };
+                                                let Some(strike) = market.strike_price else { continue };
+
+                                                let dist = distance_from_strike_pct(spot_val, strike);
+                                                if dist > atm_threshold { continue; }
+                                                if total_pos >= max_contracts { continue; }
+
+                                                let (ya, na) = (market.yes_ask.unwrap_or(100), market.no_ask.unwrap_or(100));
+                                                let ord = s.orders.get(&mid).cloned().unwrap_or_default();
+                                                if (ord.yes_order_id.is_none() && ya > bid_price) || (ord.no_order_id.is_none() && na > bid_price) {
+                                                    atm_trades.push((mid, market.yes_token.clone(), market.no_token.clone(), ya, na, market.asset.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Execute trades outside the lock
+                                    for (mid, ytok, ntok, yask, nask, asset) in atm_trades {
+                                        let ord = state.read().await.orders.get(&mid).cloned().unwrap_or_default();
+                                        let (need_y, need_n) = (ord.yes_order_id.is_none() && yask > bid_price, ord.no_order_id.is_none() && nask > bid_price);
+
+                                        if dry_run {
+                                            if need_y { warn!("🔔🔔🔔 [WS-PRICE] Would BID {} YES @{}¢ | ask={}¢ | {} 🔔🔔🔔", contracts, bid_price, yask, asset); }
+                                            if need_n { warn!("🔔🔔🔔 [WS-PRICE] Would BID {} NO @{}¢ | ask={}¢ | {} 🔔🔔🔔", contracts, bid_price, nask, asset); }
+                                        } else {
+                                            let pr = bid_price as f64 / 100.0;
+                                            let min_c = (1.0 / pr).ceil();
+                                            let total_pos: f64 = state.read().await.positions.values().map(|p| p.yes_qty + p.no_qty).sum();
+                                            let remaining = max_contracts - total_pos;
+                                            if remaining >= min_c {
+                                                let act_c = min_c.min(remaining);
+                                                if need_y {
+                                                    warn!("🔔🔔🔔 [WS-PRICE] 📝 BID {:.0} YES @{}¢ | ask={}¢ | {} 🔔🔔🔔", act_c, bid_price, yask, asset);
+                                                    if let Ok(f) = shared_client.buy_fak(&ytok, pr, act_c).await {
+                                                        if f.filled_size > 0.0 {
+                                                            let fp = (f.fill_cost / f.filled_size * 100.0).round() as i64;
+                                                            warn!("🔔 [WS-PRICE] ✅ YES Filled {:.2} @{}¢ (${:.2})", f.filled_size, fp, f.fill_cost);
+                                                            let mut st = state.write().await;
+                                                            if let Some(p) = st.positions.get_mut(&mid) { p.yes_qty += f.filled_size; p.yes_cost += f.fill_cost; }
+                                                        }
+                                                    }
+                                                }
+                                                if need_n {
+                                                    warn!("🔔🔔🔔 [WS-PRICE] 📝 BID {:.0} NO @{}¢ | ask={}¢ | {} 🔔🔔🔔", act_c, bid_price, nask, asset);
+                                                    if let Ok(f) = shared_client.buy_fak(&ntok, pr, act_c).await {
+                                                        if f.filled_size > 0.0 {
+                                                            let fp = (f.fill_cost / f.filled_size * 100.0).round() as i64;
+                                                            warn!("🔔 [WS-PRICE] ✅ NO Filled {:.2} @{}¢ (${:.2})", f.filled_size, fp, f.fill_cost);
+                                                            let mut st = state.write().await;
+                                                            if let Some(p) = st.positions.get_mut(&mid) { p.no_qty += f.filled_size; p.no_cost += f.fill_cost; }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }

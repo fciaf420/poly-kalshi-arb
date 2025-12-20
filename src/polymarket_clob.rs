@@ -214,7 +214,9 @@ impl SignedOrder {
         buf.push_str(r#"","feeRateBps":""#);
         buf.push_str(&self.order.fee_rate_bps);
         buf.push_str(r#"","side":""#);
-        buf.push_str(&self.order.side.to_string());
+        // Python client sends "BUY"/"SELL" strings, not "0"/"1"
+        let side_str = if self.order.side == 0 { "BUY" } else { "SELL" };
+        buf.push_str(side_str);
         buf.push_str(r#"","signatureType":"#);
         buf.push_str(&self.order.signature_type.to_string());
         buf.push_str(r#","signature":""#);
@@ -266,15 +268,12 @@ pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u12
 /// Input: size in micro-units, price in basis points
 /// Output: (side=1, maker_amount, taker_amount) in token decimals (6 dp)
 ///
-/// NOTE: Polymarket SELL orders are currently broken in the API.
-/// The API calculates price as maker/taker (giving >1 for sells),
-/// but signature validation expects maker=tokens, taker=USDC.
-/// This creates an impossible situation - we can't satisfy both constraints.
-/// For now, SELL orders are disabled and positions should be held to expiry.
+/// For SELL with side="SELL" string: API calculates price = taker/maker
+/// maker = tokens (what we give), taker = USDC (what we receive)
+/// price = taker/maker = USDC/tokens < 1 ✓
 #[inline(always)]
 pub fn get_order_amounts_sell(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // Semantically correct for contract signature:
-    // maker = tokens (what we give), taker = USDC (what we receive)
+    // Semantic order: maker=tokens, taker=USDC
     let maker = size_micro as u128;
     let taker = (size_micro as u128 * price_bps as u128) / 10000;
     (1, maker, taker)
@@ -643,7 +642,6 @@ impl SharedAsyncClient {
 
         tracing::info!("[POLY] Order: maker={} taker={} side={} price={:.2} neg_risk={}",
             signed.order.maker_amount, signed.order.taker_amount, signed.order.side, price, neg_risk);
-        tracing::info!("[POLY] Full body: {} signed.orer.price {}", body, signed.order.side);
 
         // Post order
         let resp = self.inner.post_order_async(body, &self.creds).await?;
@@ -673,10 +671,11 @@ impl SharedAsyncClient {
         let taking_amount = resp_json["takingAmount"].as_str().unwrap_or("0");
         let making_amount = resp_json["makingAmount"].as_str().unwrap_or("0");
 
-        tracing::debug!("[POLY] {} {} @ {:.2} -> status={}", side, size, price, status);
+        tracing::info!("[POLY] Response: status={} taking={} making={}", status, taking_amount, making_amount);
 
         // If order was matched immediately, use response data directly
         if status == "matched" && success {
+            // API returns amounts already in human units (contracts, dollars)
             let filled_size: f64 = taking_amount.parse().unwrap_or(0.0);
             let cost: f64 = making_amount.parse().unwrap_or(0.0);
             let price_per_share_cents = if filled_size > 0.0 { (cost / filled_size * 100.0).round() as i64 } else { 0 };

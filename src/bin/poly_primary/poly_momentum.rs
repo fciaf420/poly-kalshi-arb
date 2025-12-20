@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use arb_bot::polymarket_clob::{PolymarketAsyncClient, SharedAsyncClient, PreparedCreds};
 use arb_bot::polymarket_markets::{discover_markets, PolyMarket};
@@ -43,10 +43,6 @@ struct Args {
     /// Price move threshold in basis points per tick (default: 5 = 0.05%)
     #[arg(short, long, default_value_t = 3)]
     threshold_bps: i64,
-
-    /// Minimum edge in cents vs market price (default: 3)
-    #[arg(short, long, default_value_t = 3)]
-    edge: i64,
 
     /// Live trading mode (default is dry run)
     #[arg(short, long, default_value_t = false)]
@@ -376,7 +372,7 @@ async fn run_price_feed(
                                                     .unwrap_or(true);
 
                                                 if should_signal {
-                                                    warn!("[poly_momentum] {} {:?} {}bps ${:.2}",
+                                                    info!("[poly_momentum] {} {:?} {}bps ${:.2}",
                                                           asset, direction, change_bps.abs(), price);
 
                                                     tracker.last_signal_time = Some(Instant::now());
@@ -566,7 +562,7 @@ async fn run_direct_price_feed(
                                                     .unwrap_or(true);
 
                                                 if should_signal {
-                                                    warn!("[poly_momentum] {} {:?} {}bps ${:.2}",
+                                                    info!("[poly_momentum] {} {:?} {}bps ${:.2}",
                                                           asset, direction, change_bps.abs(), price);
 
                                                     tracker.last_signal_time = Some(Instant::now());
@@ -663,8 +659,8 @@ async fn main() -> Result<()> {
 
     let mode = if args.live { "LIVE" } else { "DRY" };
     let sym_str = args.sym.as_deref().unwrap_or("ALL");
-    info!("[poly_momentum] {} | {} | {}bps | {}¢ edge | max {} | TP {}¢",
-          mode, sym_str, args.threshold_bps, args.edge, args.max_contracts, args.take_profit);
+    info!("[poly_momentum] {} | {} | {}bps threshold | max {} | TP {}¢",
+          mode, sym_str, args.threshold_bps, args.max_contracts, args.take_profit);
 
     // Load credentials from project root .env
     let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -771,7 +767,6 @@ async fn main() -> Result<()> {
             .collect()
     };
 
-    let edge_threshold = args.edge;
     let contracts = args.contracts;
     let dry_run = !args.live;
     let status_symbol = args.sym;
@@ -913,7 +908,7 @@ async fn main() -> Result<()> {
                             let cost = size * entry as f64 / 100.0;
                             let revenue = size * bid as f64 / 100.0;
                             let profit = revenue - cost;
-                            warn!("[poly_momentum] 💰 SELL {:.1} {} @{}¢ (cost=${:.2} rev=${:.2} +${:.2})",
+                            info!("[poly_momentum] 💰 SELL {:.1} {} @{}¢ (cost=${:.2} rev=${:.2} +${:.2})",
                                   size, asset, bid, cost, revenue, profit);
 
                             tokio::spawn(async move {
@@ -922,7 +917,7 @@ async fn main() -> Result<()> {
                                 info!("sell price: {}", sell_price);
                                 match client.sell_fak(&token_clone, sell_price, size).await {
                                     Ok(fill) if fill.filled_size > 0.0 => {
-                                        warn!("[poly_momentum] ✅ Sold {:.1} @${:.2}", fill.filled_size, fill.fill_cost);
+                                        info!("[poly_momentum] ✅ Sold {:.1} @${:.2}", fill.filled_size, fill.fill_cost);
                                         let mut s = state_clone.write().await;
                                         s.remove_position(&token_clone);
                                     }
@@ -985,23 +980,8 @@ async fn main() -> Result<()> {
                             continue;
                         };
 
-                        // Calculate fair value based on position vs strike
-                        let estimated_fair = market.calc_fair_yes(current_price).unwrap_or(50);
-
-                        // For NO side, fair = 100 - YES fair
-                        let (fair_for_side, edge) = match signal.direction {
-                            Direction::Up => (estimated_fair, estimated_fair - ask),
-                            Direction::Down => {
-                                let fair_no = 100 - estimated_fair;
-                                (fair_no, fair_no - ask)
-                            }
-                        };
-
-                        if edge < edge_threshold {
-                            tracing::debug!("[poly_momentum] {} {} - edge {}¢ < {}¢ (ask={}¢ fair={}¢)",
-                                  signal.asset, buy_side, edge, edge_threshold, ask, fair_for_side);
-                            continue;
-                        }
+                        // Front-running strategy: just trade on momentum, no fair value calc
+                        // We're betting the market hasn't priced in the move yet
 
                         // Calculate remaining capacity
                         let remaining = max_contracts - current_position;
@@ -1013,25 +993,28 @@ async fn main() -> Result<()> {
 
                         // Add 2¢ to cross the spread and ensure FAK fills
                         let cross_price = entry_price.min(99) as f64 / 100.0;
-                        // Polymarket requires minimum $1 order value - scale up contracts if needed
-                        let min_contracts = (1.0 / cross_price).ceil();
-                        // Don't exceed remaining capacity
-                        let actual_contracts = contracts.max(min_contracts).min(remaining);
-                        let cost = actual_contracts * cross_price;
 
-                        // Skip if below $1 minimum or less than 1 contract
-                        if cost < 1.0 || actual_contracts < 1.0 {
-                            tracing::debug!("[poly_momentum] Skip: cost ${:.2} < $1 min (remaining={:.1})", cost, remaining);
+                        // Polymarket requires minimum $1 order value for marketable orders
+                        let min_contracts = (1.0 / cross_price).ceil();
+
+                        // If we don't have enough capacity for $1 minimum, skip silently
+                        if remaining < min_contracts {
+                            debug!("[poly_momentum] Skip {} {}: need {} contracts for $1 min, only {:.0} capacity",
+                                   signal.asset, buy_side, min_contracts as i64, remaining);
                             continue;
                         }
 
+                        // Use minimum contracts needed to meet $1 threshold
+                        let actual_contracts = min_contracts.min(remaining);
+                        let cost = actual_contracts * cross_price;
+
                         if dry_run {
-                            warn!("[poly_momentum] 🎯 Would BUY {:.0} {} {} @{}¢ (${:.2}) | edge={}¢",
-                                  actual_contracts, signal.asset, buy_side, entry_price, cost, edge);
+                            info!("[poly_momentum] 🎯 Would BUY {:.0} {} {} @{}¢ (${:.2}) | {}bps",
+                                  actual_contracts, signal.asset, buy_side, entry_price, cost, signal.move_bps);
                             market.last_trade_time = Some(Instant::now());
                         } else {
-                            warn!("[poly_momentum] 🎯 BUY {:.0} {} {} @{}¢ (${:.2}) | edge={}¢",
-                                  actual_contracts, signal.asset, buy_side, entry_price, cost, edge);
+                            info!("[poly_momentum] 🎯 BUY {:.0} {} {} @{}¢ (${:.2}) | {}bps",
+                                  actual_contracts, signal.asset, buy_side, entry_price, cost, signal.move_bps);
 
                             let client = shared_client.clone();
                             let state_clone = state.clone();
@@ -1040,7 +1023,7 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 match client.buy_fak(&buy_token_clone, cross_price, actual_contracts).await {
                                     Ok(fill) if fill.filled_size > 0.0 => {
-                                        warn!("[poly_momentum] ✅ Filled {:.1} @${:.2}",
+                                        info!("[poly_momentum] ✅ Filled {:.1} @${:.2}",
                                               fill.filled_size, fill.fill_cost);
 
                                         let mut s = state_clone.write().await;
