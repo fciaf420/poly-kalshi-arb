@@ -45,6 +45,10 @@ struct Args {
     #[arg(short, long, default_value_t = 45)]
     bid: i64,
 
+    /// Number of contracts per trade
+    #[arg(short, long, default_value_t = 1.0)]
+    contracts: f64,
+
     /// ATM threshold: max % distance from strike to be considered ATM (default: 0.0015%)
     /// Price must be within this percentage of strike for delta ≈ 0.50
     #[arg(long, default_value_t = 0.0015)]
@@ -550,7 +554,7 @@ async fn main() -> Result<()> {
     info!("CONFIG:");
     info!("   Mode: {}", if args.live { "🚀 LIVE" } else { "🔍 DRY RUN" });
     info!("   Price Feed: {}", if args.direct { "Direct Polygon.io" } else { "Local server (ws://127.0.0.1:9999)" });
-    info!("   Size: ${:.2} per trade", args.size);
+    info!("   Contracts: {} per trade", args.contracts);
     info!("   Max bid: {}¢", args.bid);
     info!("   ATM threshold: {:.4}%", args.atm_threshold);
     info!("   Time window: {}m - {}m before expiry", args.min_minutes, args.max_minutes);
@@ -646,7 +650,7 @@ async fn main() -> Result<()> {
 
     // Main WebSocket loop
     let bid_price = args.bid;
-    let size = args.size;
+    let contracts = args.contracts;
     let atm_threshold = args.atm_threshold;
     let dry_run = !args.live;
     let min_minutes = args.min_minutes as f64;
@@ -859,21 +863,20 @@ async fn main() -> Result<()> {
 
                                     if dry_run {
                                         if need_yes && yes_worth_bidding {
-                                            info!("[DRY] Would BID ${:.0} YES @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            info!("[DRY] Would BID {} contracts YES @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
                                         }
                                         if need_no && no_worth_bidding {
-                                            info!("[DRY] Would BID ${:.0} NO @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            info!("[DRY] Would BID {} contracts NO @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
                                         }
                                     } else {
                                         // Place YES bid
                                         if need_yes && yes_worth_bidding {
                                             let price = bid_price as f64 / 100.0;
-                                            let contracts = size / price;
 
-                                            warn!("[TRADE] 📝 BID ${:.0} YES @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            warn!("[TRADE] 📝 BID {} contracts YES @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
 
                                             match shared_client.buy_fak(&yes_token, price, contracts).await {
                                                 Ok(fill) => {
@@ -897,10 +900,9 @@ async fn main() -> Result<()> {
                                         // Place NO bid
                                         if need_no && no_worth_bidding {
                                             let price = bid_price as f64 / 100.0;
-                                            let contracts = size / price;
 
-                                            warn!("[TRADE] 📝 BID ${:.0} NO @{}¢ | delta≈0.50 | {}",
-                                                  size, bid_price, asset);
+                                            warn!("[TRADE] 📝 BID {} contracts NO @{}¢ | delta≈0.50 | {}",
+                                                  contracts, bid_price, asset);
 
                                             match shared_client.buy_fak(&no_token, price, contracts).await {
                                                 Ok(fill) => {

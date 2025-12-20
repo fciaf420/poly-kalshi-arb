@@ -10,6 +10,7 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H256;
 use ethers::types::transaction::eip712::{Eip712, TypedData};
 use ethers::types::U256;
+use ethers::utils::to_checksum;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use serde_json::json;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::{info, log};
+use log::info;
 
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
@@ -190,7 +191,6 @@ pub struct SignedOrder {
 
 impl SignedOrder {
     pub fn post_body(&self, owner: &str, order_type: &str) -> String {
-        let side_str = if self.order.side == 0 { "BUY" } else { "SELL" };
         let mut buf = String::with_capacity(512);
         buf.push_str(r#"{"order":{"salt":"#);
         buf.push_str(&self.order.salt.to_string());
@@ -213,7 +213,7 @@ impl SignedOrder {
         buf.push_str(r#"","feeRateBps":""#);
         buf.push_str(&self.order.fee_rate_bps);
         buf.push_str(r#"","side":""#);
-        buf.push_str(side_str);
+        buf.push_str(&self.order.side.to_string());
         buf.push_str(r#"","signatureType":"#);
         buf.push_str(&self.order.signature_type.to_string());
         buf.push_str(r#","signature":""#);
@@ -411,8 +411,8 @@ pub struct PolymarketAsyncClient {
 impl PolymarketAsyncClient {
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
-        // Use Debug format for full checksummed address - ethers 2.0 Display truncates
-        let wallet_address_str = format!("{:?}", wallet.address());
+        // Use to_checksum for proper EIP-55 checksummed address
+        let wallet_address_str = to_checksum(&wallet.address(), None);
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
@@ -425,10 +425,10 @@ impl PolymarketAsyncClient {
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
 
-        // Parse funder as Address to get checksummed format for EIP712 signing
+        // Parse funder as Address to get proper EIP-55 checksummed format
         let funder_addr: ethers::types::Address = funder.parse()
             .map_err(|e| anyhow!("Invalid funder address: {}", e))?;
-        let funder_checksummed = format!("{}", funder_addr);
+        let funder_checksummed = to_checksum(&funder_addr, None);
 
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
@@ -680,7 +680,7 @@ impl SharedAsyncClient {
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
 
-        // Use references for EIP712 signing 
+        // Use references for EIP712 signing
         let data = OrderData {
             maker: &self.inner.funder,
             taker: ZERO_ADDRESS,
@@ -692,13 +692,12 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: 0,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
         let typed = order_typed_data(self.chain_id, &exchange, &data)?;
         let digest = typed.encode_eip712()?;
-
         let sig = self.inner.wallet.sign_hash(H256::from(digest))?;
 
         // Only allocate strings once for the final OrderStruct (serialization needs owned)
@@ -715,7 +714,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: 0,
             },
             signature: format!("0x{}", sig),
         })

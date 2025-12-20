@@ -10,5 +10,6 @@ pub mod kalshi;
 pub mod paper_trading;
 pub mod polymarket;
 pub mod polymarket_clob;
+pub mod polymarket_markets;
 pub mod position_tracker;
 pub mod types;

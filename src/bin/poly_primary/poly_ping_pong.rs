@@ -44,7 +44,7 @@ struct Args {
     max_arb_cost: i64,
 
     /// Number of contracts to buy per trade
-    #[arg(short, long, default_value_t = 50.0)]
+    #[arg(short, long, default_value_t = 1.0)]
     contracts: f64,
 
     /// Live trading mode (default is dry run)
@@ -367,6 +367,11 @@ async fn discover_markets(market_filter: Option<&str>) -> Result<Vec<Market>> {
     let mut seen = std::collections::HashSet::new();
     markets.retain(|m| seen.insert(m.condition_id.clone()));
 
+    // Only keep markets expiring within 16 minutes
+    markets.retain(|m| {
+        m.minutes_remaining().map(|mins| mins > 0.0 && mins <= 16.0).unwrap_or(false)
+    });
+
     markets.sort_by(|a, b| {
         a.end_time
             .cmp(&b.end_time)
@@ -514,6 +519,7 @@ async fn main() -> Result<()> {
     let min_minutes = args.min_minutes as f64;
     let max_minutes = args.max_minutes as f64;
     let max_age = args.max_age;
+    let log_filter = symbol_filter.clone();
 
     loop {
         info!("[WS] Connecting to Polymarket WebSocket {}...", POLYMARKET_WS_URL);
@@ -562,6 +568,13 @@ async fn main() -> Result<()> {
                     let price_status = if price_age_secs < 5 { "●" } else if price_age_secs < 30 { "○" } else { "✗" };
 
                     for (id, market) in &s.markets {
+                        // Filter by symbol if specified
+                        if let Some(ref filter) = log_filter {
+                            if !market.asset.to_lowercase().contains(filter) {
+                                continue;
+                            }
+                        }
+
                         let pos = s.positions.get(id).cloned().unwrap_or_default();
                         let expiry = market.minutes_remaining().unwrap_or(0.0);
                         let market_age = 15.0 - expiry; // How many minutes into the market
@@ -697,6 +710,13 @@ async fn main() -> Result<()> {
                                         })
                                         .max_by_key(|(p, _)| *p);
 
+                                    // Total liquidity across all ask levels
+                                    let total_ask_size: f64 = book
+                                        .asks
+                                        .iter()
+                                        .map(|l| parse_size(&l.size))
+                                        .sum();
+
                                     let Some(market) = s.markets.get_mut(&market_id) else {
                                         continue;
                                     };
@@ -706,11 +726,11 @@ async fn main() -> Result<()> {
                                     if is_yes {
                                         market.yes_ask = best_ask.map(|(p, _)| p);
                                         market.yes_bid = best_bid.map(|(p, _)| p);
-                                        market.yes_ask_size = best_ask.map(|(_, s)| s).unwrap_or(0.0);
+                                        market.yes_ask_size = total_ask_size;
                                     } else {
                                         market.no_ask = best_ask.map(|(p, _)| p);
                                         market.no_bid = best_bid.map(|(p, _)| p);
-                                        market.no_ask_size = best_ask.map(|(_, s)| s).unwrap_or(0.0);
+                                        market.no_ask_size = total_ask_size;
                                     }
 
                                     // Extract values
