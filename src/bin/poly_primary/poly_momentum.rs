@@ -228,7 +228,20 @@ impl State {
             entry_price,
             size,
             _opened_at: Instant::now(),
+            sell_pending: false,
         });
+    }
+
+    fn mark_sell_pending(&mut self, token_id: &str) {
+        if let Some(pos) = self.open_positions.iter_mut().find(|p| p.token_id == token_id) {
+            pos.sell_pending = true;
+        }
+    }
+
+    fn clear_sell_pending(&mut self, token_id: &str) {
+        if let Some(pos) = self.open_positions.iter_mut().find(|p| p.token_id == token_id) {
+            pos.sell_pending = false;
+        }
     }
 
     fn remove_position(&mut self, token_id: &str) {
@@ -883,11 +896,19 @@ async fn main() -> Result<()> {
                     let mut s = state.write().await;
 
                     // Check for profit-taking opportunities (both live and paper)
-                    if !s.open_positions.is_empty() {
+                    // Only log tracking when there are actual positions without pending sells
+                    let active_positions = s.open_positions.iter()
+                        .filter(|p| !p.sell_pending)
+                        .count();
+
+                    if active_positions > 0 {
                         let mode_tag = if dry_run { "[DRY]" } else { "[LIVE]" };
-                        info!("[poly_momentum] {} Tracking {} positions", mode_tag, s.open_positions.len());
+                        tracing::debug!("[poly_momentum] {} Tracking {} positions ({} active)",
+                                       mode_tag, s.open_positions.len(), active_positions);
+
                         // (token_id, asset, bid, size, entry_price)
                         let positions_to_close: Vec<(String, String, i64, f64, i64)> = s.open_positions.iter()
+                            .filter(|pos| !pos.sell_pending) // Skip positions with pending sells
                             .filter_map(|pos| {
                                 // Find the market for this position
                                 let market = s.markets.values().find(|m|
@@ -917,6 +938,9 @@ async fn main() -> Result<()> {
                                       size, asset, bid, cost, revenue, profit);
                                 s.remove_position(&token_id);
                             } else {
+                                // Mark as pending before spawning async task
+                                s.mark_sell_pending(&token_id);
+
                                 let client = shared_client.clone();
                                 let state_clone = state.clone();
                                 let token_clone = token_id.clone();
@@ -932,9 +956,16 @@ async fn main() -> Result<()> {
                                             let mut s = state_clone.write().await;
                                             s.remove_position(&token_clone);
                                         }
-                                        Ok(_) => {}
+                                        Ok(_) => {
+                                            // No fill - FAK killed, clear pending flag
+                                            let mut s = state_clone.write().await;
+                                            s.clear_sell_pending(&token_clone);
+                                        }
                                         Err(e) => {
                                             error!("[poly_momentum] ❌ Sell error: {}", e);
+                                            // Clear pending flag on error so we can retry
+                                            let mut s = state_clone.write().await;
+                                            s.clear_sell_pending(&token_clone);
                                         }
                                     }
                                 });
