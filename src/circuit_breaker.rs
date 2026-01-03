@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, warn, info};
 
+use crate::simulation::DrawdownTracker;
+
 /// Circuit breaker configuration from environment
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
@@ -23,9 +25,15 @@ pub struct CircuitBreakerConfig {
     
     /// Cooldown period after a trip (seconds)
     pub cooldown_secs: u64,
-    
+
     /// Whether circuit breakers are enabled
     pub enabled: bool,
+
+    /// Drawdown threshold (0.0-1.0, e.g., 0.10 = 10% drawdown triggers halt)
+    pub max_drawdown: f64,
+
+    /// Initial equity for drawdown tracking
+    pub initial_equity: f64,
 }
 
 impl CircuitBreakerConfig {
@@ -55,10 +63,20 @@ impl CircuitBreakerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300), // 5 minutes default
-            
+
             enabled: std::env::var("CB_ENABLED")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(true), // Enabled by default for safety
+
+            max_drawdown: std::env::var("CB_MAX_DRAWDOWN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.10), // 10% drawdown default
+
+            initial_equity: std::env::var("CB_INITIAL_EQUITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000.0), // $1000 default
         }
     }
 }
@@ -69,6 +87,7 @@ pub enum TripReason {
     MaxPositionPerMarket { market: String, position: i64, limit: i64 },
     MaxTotalPosition { position: i64, limit: i64 },
     MaxDailyLoss { loss: f64, limit: f64 },
+    MaxDrawdown { drawdown_pct: f64, peak_equity: f64, current_equity: f64 },
     ConsecutiveErrors { count: u32, limit: u32 },
     ManualHalt,
 }
@@ -84,6 +103,10 @@ impl std::fmt::Display for TripReason {
             }
             TripReason::MaxDailyLoss { loss, limit } => {
                 write!(f, "Max daily loss: ${:.2} (limit: ${:.2})", loss, limit)
+            }
+            TripReason::MaxDrawdown { drawdown_pct, peak_equity, current_equity } => {
+                write!(f, "Max drawdown: {:.1}% from peak (peak=${:.2}, current=${:.2})",
+                       drawdown_pct * 100.0, peak_equity, current_equity)
             }
             TripReason::ConsecutiveErrors { count, limit } => {
                 write!(f, "Consecutive errors: {} (limit: {})", count, limit)
@@ -119,24 +142,27 @@ impl MarketPosition {
 /// Circuit breaker state
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
-    
+
     /// Whether trading is currently halted
     halted: AtomicBool,
-    
+
     /// When the circuit breaker was tripped
     tripped_at: RwLock<Option<Instant>>,
-    
+
     /// Reason for trip
     trip_reason: RwLock<Option<TripReason>>,
-    
+
     /// Consecutive error count
     consecutive_errors: AtomicI64,
-    
+
     /// Daily P&L tracking (in cents)
     daily_pnl_cents: AtomicI64,
-    
+
     /// Positions per market
     positions: RwLock<std::collections::HashMap<String, MarketPosition>>,
+
+    /// Drawdown tracker for trailing equity protection
+    drawdown_tracker: DrawdownTracker,
 }
 
 impl CircuitBreaker {
@@ -146,9 +172,17 @@ impl CircuitBreaker {
         info!("[CB]   Max position per market: {} contracts", config.max_position_per_market);
         info!("[CB]   Max total position: {} contracts", config.max_total_position);
         info!("[CB]   Max daily loss: ${:.2}", config.max_daily_loss);
+        info!("[CB]   Max drawdown: {:.1}%", config.max_drawdown * 100.0);
+        info!("[CB]   Initial equity: ${:.2}", config.initial_equity);
         info!("[CB]   Max consecutive errors: {}", config.max_consecutive_errors);
         info!("[CB]   Cooldown: {}s", config.cooldown_secs);
-        
+
+        let drawdown_tracker = DrawdownTracker::new(
+            config.initial_equity,
+            config.max_drawdown,
+            config.cooldown_secs,
+        );
+
         Self {
             config,
             halted: AtomicBool::new(false),
@@ -157,6 +191,7 @@ impl CircuitBreaker {
             consecutive_errors: AtomicI64::new(0),
             daily_pnl_cents: AtomicI64::new(0),
             positions: RwLock::new(std::collections::HashMap::new()),
+            drawdown_tracker,
         }
     }
     
@@ -251,6 +286,38 @@ impl CircuitBreaker {
         self.daily_pnl_cents.fetch_add(pnl_cents, Ordering::SeqCst);
     }
 
+    /// Update current equity and check for drawdown
+    ///
+    /// This should be called periodically with the current total equity.
+    /// Returns true if trading is allowed, false if halted due to drawdown.
+    pub async fn update_equity(&self, current_equity: f64) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+
+        let allowed = self.drawdown_tracker.update_equity(current_equity);
+
+        if !allowed && !self.halted.load(Ordering::SeqCst) {
+            // Drawdown tracker triggered halt, sync with circuit breaker
+            let peak = self.drawdown_tracker.peak_equity();
+            let drawdown_pct = self.drawdown_tracker.current_drawdown(current_equity);
+
+            self.trip(TripReason::MaxDrawdown {
+                drawdown_pct,
+                peak_equity: peak,
+                current_equity,
+            }).await;
+        }
+
+        allowed
+    }
+
+    /// Get current drawdown status
+    #[allow(dead_code)]
+    pub fn drawdown_status(&self, current_equity: f64) -> crate::simulation::DrawdownStatus {
+        self.drawdown_tracker.status(current_equity)
+    }
+
     /// Trip the circuit breaker
     pub async fn trip(&self, reason: TripReason) {
         if !self.config.enabled {
@@ -309,10 +376,10 @@ impl CircuitBreaker {
 
     /// Get current status
     #[allow(dead_code)]
-    pub async fn status(&self) -> CircuitBreakerStatus {
+    pub async fn status(&self, current_equity: f64) -> CircuitBreakerStatus {
         let positions = self.positions.read().await;
         let total_position: i64 = positions.values().map(|p| p.total_contracts()).sum();
-        
+
         CircuitBreakerStatus {
             enabled: self.config.enabled,
             halted: self.halted.load(Ordering::SeqCst),
@@ -321,6 +388,9 @@ impl CircuitBreaker {
             daily_pnl: self.daily_pnl_cents.load(Ordering::SeqCst) as f64 / 100.0,
             total_position,
             market_count: positions.len(),
+            peak_equity: self.drawdown_tracker.peak_equity(),
+            current_drawdown_pct: self.drawdown_tracker.current_drawdown(current_equity) * 100.0,
+            max_drawdown_pct: self.config.max_drawdown * 100.0,
         }
     }
 }
@@ -335,6 +405,9 @@ pub struct CircuitBreakerStatus {
     pub daily_pnl: f64,
     pub total_position: i64,
     pub market_count: usize,
+    pub peak_equity: f64,
+    pub current_drawdown_pct: f64,
+    pub max_drawdown_pct: f64,
 }
 
 impl std::fmt::Display for CircuitBreakerStatus {
@@ -342,7 +415,7 @@ impl std::fmt::Display for CircuitBreakerStatus {
         if !self.enabled {
             return write!(f, "Circuit Breaker: DISABLED");
         }
-        
+
         if self.halted {
             write!(f, "Circuit Breaker: 🛑 HALTED")?;
             if let Some(reason) = &self.trip_reason {
@@ -351,60 +424,90 @@ impl std::fmt::Display for CircuitBreakerStatus {
         } else {
             write!(f, "Circuit Breaker: ✅ OK")?;
         }
-        
-        write!(f, " | P&L: ${:.2} | Pos: {} contracts across {} markets | Errors: {}",
-               self.daily_pnl, self.total_position, self.market_count, self.consecutive_errors)
+
+        write!(f, " | P&L: ${:.2} | Pos: {} | DD: {:.1}%/{:.1}% | Peak: ${:.2}",
+               self.daily_pnl, self.total_position,
+               self.current_drawdown_pct, self.max_drawdown_pct,
+               self.peak_equity)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    #[tokio::test]
-    async fn test_circuit_breaker_position_limit() {
-        let config = CircuitBreakerConfig {
+
+    fn test_config() -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
             max_position_per_market: 10,
             max_total_position: 50,
             max_daily_loss: 100.0,
             max_consecutive_errors: 3,
             cooldown_secs: 60,
             enabled: true,
-        };
-        
+            max_drawdown: 0.10,
+            initial_equity: 1000.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_position_limit() {
+        let config = test_config();
+
         let cb = CircuitBreaker::new(config);
-        
+
         // Should allow initial trade
         assert!(cb.can_execute("market1", 5).await.is_ok());
-        
+
         // Record the trade
         cb.record_success("market1", 5, 5, 0.0).await;
-        
+
         // Should reject trade exceeding per-market limit
         let result = cb.can_execute("market1", 10).await;
         assert!(matches!(result, Err(TripReason::MaxPositionPerMarket { .. })));
     }
-    
+
     #[tokio::test]
     async fn test_consecutive_errors() {
-        let config = CircuitBreakerConfig {
-            max_position_per_market: 100,
-            max_total_position: 500,
-            max_daily_loss: 100.0,
-            max_consecutive_errors: 3,
-            cooldown_secs: 60,
-            enabled: true,
-        };
-        
+        let mut config = test_config();
+        config.max_position_per_market = 100;
+        config.max_total_position = 500;
+
         let cb = CircuitBreaker::new(config);
-        
+
         // Record errors
         cb.record_error().await;
         cb.record_error().await;
         assert!(cb.is_trading_allowed());
-        
+
         // Third error should trip
         cb.record_error().await;
         assert!(!cb.is_trading_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_drawdown_stop() {
+        let mut config = test_config();
+        config.max_drawdown = 0.10; // 10% drawdown
+        config.initial_equity = 1000.0;
+        config.cooldown_secs = 1; // Short cooldown for test
+
+        let cb = CircuitBreaker::new(config);
+
+        // Initial equity - should be allowed
+        assert!(cb.update_equity(1000.0).await);
+
+        // New high - should be allowed
+        assert!(cb.update_equity(1100.0).await);
+
+        // Small drawdown (5%) - should be allowed
+        assert!(cb.update_equity(1045.0).await);
+
+        // Large drawdown (15%) - should halt
+        assert!(!cb.update_equity(935.0).await);
+        assert!(!cb.is_trading_allowed());
+
+        // Check trip reason
+        let reason = cb.trip_reason.read().await.clone();
+        assert!(matches!(reason, Some(TripReason::MaxDrawdown { .. })));
     }
 }

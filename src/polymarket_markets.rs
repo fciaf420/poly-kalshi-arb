@@ -41,6 +41,8 @@ pub struct GammaEvent {
 /// Core Polymarket market data from Gamma API
 #[derive(Debug, Clone)]
 pub struct PolyMarket {
+    /// Event slug for resolution lookup
+    pub event_slug: Option<String>,
     /// Unique market identifier
     pub condition_id: String,
     /// Market question/title
@@ -204,6 +206,7 @@ pub async fn discover_markets(asset_filter: Option<&str>) -> Result<Vec<PolyMark
 
                 markets.push(PolyMarket {
                     condition_id: cid,
+                    event_slug: Some(event_slug.clone()),
                     question,
                     yes_token: token_ids[0].clone(),
                     no_token: token_ids[1].clone(),
@@ -350,6 +353,7 @@ pub async fn discover_all_markets(asset_filter: Option<&str>) -> Result<Vec<Poly
 
                 markets.push(PolyMarket {
                     condition_id: cid,
+                    event_slug: Some(event_slug.clone()),
                     question,
                     yes_token: token_ids[0].clone(),
                     no_token: token_ids[1].clone(),
@@ -370,3 +374,4 @@ pub async fn discover_all_markets(asset_filter: Option<&str>) -> Result<Vec<Poly
 
     Ok(markets)
 }
+

@@ -6,9 +6,10 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
-ethers = { version = "2.0", features = ["legacy"] }
+ethers = { version = "2.0", features = ["legacy", "abigen"] }
+hex = "0.4"
 futures-util = "0.3"
 hmac = "0.12"
 rand = "0.8"
@@ -33,9 +34,20 @@ clap = { version = "4.4", features = ["derive"] }
 regex-lite = "0.1"
 log = "0.4.29"
 
+# Web dashboard
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# PPO/RL support (optional - requires libtorch)
+tch = { version = "0.14", optional = true }
+safetensors = { version = "0.4", optional = true }
+
+[features]
+default = []
+rl = ["tch", "safetensors"]  # Enable RL/PPO support (requires libtorch installation)
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-hex = "0.4"
 
 [[bin]]
 name = "arb-bot"
@@ -92,6 +104,18 @@ path = "src/bin/poly_primary/poly_momentum.rs"
 [[bin]]
 name = "poly_atm_sniper"
 path = "src/bin/poly_primary/poly_atm_sniper.rs"
+
+[[bin]]
+name = "auto_claim"
+path = "src/bin/auto_claim.rs"
+
+[[bin]]
+name = "price_feed"
+path = "src/bin/price_feed.rs"
+
+[[bin]]
+name = "compare_price_feeds"
+path = "src/bin/compare_price_feeds.rs"
 
 [profile.release]
 opt-level = 3

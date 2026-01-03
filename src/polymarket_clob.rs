@@ -1,4 +1,4 @@
-// src/polymarket_clob.rs
+﻿// src/polymarket_clob.rs
 // Polymarket CLOB Client
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -256,11 +256,17 @@ pub fn size_to_micro(size: f64) -> u64 {
 /// BUY order calculation
 /// Input: size in micro-units, price in basis points
 /// Output: (side=0, maker_amount, taker_amount) in token decimals (6 dp)
+///
+/// IMPORTANT: Polymarket requires specific precision for buy orders:
+/// - maker (USDC we pay) = max 2 decimal places (must be divisible by 10000)
+/// - taker (tokens we receive) = max 4 decimal places (must be divisible by 100)
 #[inline(always)]
 pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u128) {
-    // For BUY: taker = size (what we receive), maker = size * price (what we pay)
-    let taker = size_micro as u128;
-    let maker = (size_micro as u128 * price_bps as u128) / 10000;
+    // Round taker (tokens we receive) down to 4 decimal places (divisible by 100)
+    let taker = (size_micro as u128 / 100) * 100;
+    // Calculate maker (USDC we pay) and round down to 2 decimal places (divisible by 10000)
+    let maker_raw = (taker * price_bps as u128) / 10000;
+    let maker = (maker_raw / 10000) * 10000;
     (0, maker, taker)
 }
 
@@ -270,7 +276,7 @@ pub fn get_order_amounts_buy(size_micro: u64, price_bps: u64) -> (i32, u128, u12
 ///
 /// For SELL with side="SELL" string: API calculates price = taker/maker
 /// maker = tokens (what we give), taker = USDC (what we receive)
-/// price = taker/maker = USDC/tokens < 1 ✓
+/// price = taker/maker = USDC/tokens < 1 âœ“
 ///
 /// IMPORTANT: Polymarket requires specific precision for sell orders:
 /// - maker (tokens) = max 2 decimal places (must be divisible by 10000)
@@ -682,17 +688,30 @@ impl SharedAsyncClient {
         // If order was matched immediately, use response data directly
         if status == "matched" && success {
             // API returns amounts already in human units (contracts, dollars)
-            let filled_size: f64 = taking_amount.parse().unwrap_or(0.0);
-            let cost: f64 = making_amount.parse().unwrap_or(0.0);
-            let price_per_share_cents = if filled_size > 0.0 { (cost / filled_size * 100.0).round() as i64 } else { 0 };
-            info!("[POLY] ✅ {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, cost);
+            // BUY: taking = tokens, making = USDC
+            // SELL: making = tokens, taking = USDC
+            let filled_size: f64 = if side.eq_ignore_ascii_case("SELL") {
+                making_amount.parse().unwrap_or(0.0)
+            } else {
+                taking_amount.parse().unwrap_or(0.0)
+            };
+            let cost: f64 = if side.eq_ignore_ascii_case("SELL") {
+                taking_amount.parse().unwrap_or(0.0)
+            } else {
+                making_amount.parse().unwrap_or(0.0)
+            };
+            let price_per_share_cents = if filled_size > 0.0 {
+                (cost / filled_size * 100.0).round() as i64
+            } else {
+                0
+            };
+            info!("[POLY] ? {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, cost);
             return Ok(PolyFillAsync {
                 order_id,
                 filled_size,
                 fill_cost: cost,
             });
         }
-
         // Otherwise query fill status (for partial fills or pending orders)
         let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
         let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
@@ -700,7 +719,7 @@ impl SharedAsyncClient {
 
         if filled_size > 0.0 {
             let price_per_share_cents = (order_price * 100.0).round() as i64;
-            info!("[POLY] ✅ {} {:.1} @{}¢ (total ${:.2})", side, filled_size, price_per_share_cents, filled_size * order_price);
+            info!("[POLY] âœ… {} {:.1} @{}Â¢ (total ${:.2})", side, filled_size, price_per_share_cents, filled_size * order_price);
         } else {
             tracing::debug!("[POLY] No fill (status={})", order_info.status);
         }
@@ -752,7 +771,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 0,
+            signature_type: 2, // GNOSIS_SAFE for proxy wallet
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -774,7 +793,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 0,
+                signature_type: 2, // GNOSIS_SAFE for proxy wallet
             },
             signature: format!("0x{}", sig),
         })
@@ -788,3 +807,5 @@ pub struct PolyFillAsync {
     pub filled_size: f64,
     pub fill_cost: f64,
 }
+
+
